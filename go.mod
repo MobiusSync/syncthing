@@ -30,7 +30,7 @@ require (
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/lib/pq v1.10.3
-	github.com/lucas-clemente/quic-go v0.23.0
+	github.com/lucas-clemente/quic-go v0.28.0
 	github.com/maruel/panicparse v1.6.1
 	github.com/maxbrunsfeld/counterfeiter/v6 v6.3.0
 	github.com/minio/sha256-simd v1.0.0
@@ -50,8 +50,8 @@ require (
 	github.com/vitrun/qart v0.0.0-20160531060029-bf64b92db6b0
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 	golang.org/x/mod v0.5.1 // indirect
-	golang.org/x/net v0.0.0-20210924151903-3ad01bbaa167
-	golang.org/x/sys v0.0.0-20210925032602-92d5a993a665
+	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e
+	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a
 	golang.org/x/text v0.3.7
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
 	golang.org/x/tools v0.1.6
