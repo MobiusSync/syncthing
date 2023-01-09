@@ -50,12 +50,12 @@ require (
 	github.com/urfave/cli v1.22.10
 	github.com/vitrun/qart v0.0.0-20160531060029-bf64b92db6b0
 	golang.org/x/crypto v0.0.0-20220829220503-c86fa9a7ed90
-	golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4 // indirect
-	golang.org/x/net v0.0.0-20220909164309-bea034e7d591
-	golang.org/x/sys v0.0.0-20220913175220-63ea55921009
-	golang.org/x/text v0.3.7
+	golang.org/x/mod v0.7.0 // indirect
+	golang.org/x/net v0.5.0
+	golang.org/x/sys v0.4.0
+	golang.org/x/text v0.6.0
 	golang.org/x/time v0.0.0-20220722155302-e5dcc9cfc0b9
-	golang.org/x/tools v0.1.12
+	golang.org/x/tools v0.5.0
 	google.golang.org/protobuf v1.28.1
 )
 
