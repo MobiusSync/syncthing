@@ -238,7 +238,7 @@ func (m *Matcher) Match(file string) (result ignoreresult.R) {
 		return ignoreresult.NotIgnored
 	}
 
-	file = osutil.NormalizedFilename(file)
+	file = filepath.ToSlash(file)
 
 	if m.matches != nil {
 		// Check the cache for a known result.
