@@ -117,6 +117,8 @@ type Model interface {
 	DismissPendingFolder(device protocol.DeviceID, folder string) error
 
 	GlobalDirectoryTree(folder, prefix string, levels int, dirsOnly bool) ([]*TreeEntry, error)
+
+	RequestGlobal(ctx context.Context, deviceID protocol.DeviceID, folder, name string, blockNo int, offset int64, size int, hash []byte, weakHash uint32, fromTemporary bool) ([]byte, error)
 }
 
 type model struct {
@@ -1135,16 +1137,16 @@ func (p *pager) done() bool {
 // Index is called when a new device is connected and we receive their full index.
 // Implements the protocol.Model interface.
 func (m *model) Index(conn protocol.Connection, idx *protocol.Index) error {
-	return m.handleIndex(conn, idx.Folder, idx.Files, false)
+	return m.handleIndex(conn, idx.Folder, idx.Files, false, 0, idx.LastSequence)
 }
 
 // IndexUpdate is called for incremental updates to connected devices' indexes.
 // Implements the protocol.Model interface.
 func (m *model) IndexUpdate(conn protocol.Connection, idxUp *protocol.IndexUpdate) error {
-	return m.handleIndex(conn, idxUp.Folder, idxUp.Files, true)
+	return m.handleIndex(conn, idxUp.Folder, idxUp.Files, true, idxUp.PrevSequence, idxUp.LastSequence)
 }
 
-func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool) error {
+func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protocol.FileInfo, update bool, prevSequence, lastSequence int64) error {
 	op := "Index"
 	if update {
 		op += " update"
@@ -1172,7 +1174,8 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 		l.Debugf("%v for folder (ID %q) sent from device %q: missing index handler", op, folder, deviceID)
 		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
 	}
-	return indexHandler.ReceiveIndex(folder, fs, update, op)
+
+	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence)
 }
 
 type clusterConfigDeviceInfo struct {
@@ -2413,7 +2416,7 @@ func (m *model) promoteConnections() {
 			if conn.Statistics().StartedAt.IsZero() {
 				conn.SetFolderPasswords(passwords)
 				conn.Start()
-				conn.ClusterConfig(protocol.ClusterConfig{Secondary: true})
+				conn.ClusterConfig(&protocol.ClusterConfig{Secondary: true})
 			}
 		}
 	}
@@ -2461,14 +2464,14 @@ func (m *model) deviceDidCloseRLocked(deviceID protocol.DeviceID, duration time.
 	}
 }
 
-func (m *model) requestGlobal(ctx context.Context, deviceID protocol.DeviceID, folder, name string, blockNo int, offset int64, size int, hash []byte, weakHash uint32, fromTemporary bool) ([]byte, error) {
+func (m *model) RequestGlobal(ctx context.Context, deviceID protocol.DeviceID, folder, name string, blockNo int, offset int64, size int, hash []byte, weakHash uint32, fromTemporary bool) ([]byte, error) {
 	conn, connOK := m.requestConnectionForDevice(deviceID)
 	if !connOK {
 		return nil, fmt.Errorf("requestGlobal: no connection to device: %s", deviceID.Short())
 	}
 
 	l.Debugf("%v REQ(out): %s (%s): %q / %q b=%d o=%d s=%d h=%x wh=%x ft=%t", m, deviceID.Short(), conn, folder, name, blockNo, offset, size, hash, weakHash, fromTemporary)
-	return conn.Request(ctx, folder, name, blockNo, offset, size, hash, weakHash, fromTemporary)
+	return conn.Request(ctx, &protocol.Request{Folder: folder, Name: name, BlockNo: blockNo, Offset: offset, Size: size, Hash: hash, WeakHash: weakHash, FromTemporary: fromTemporary})
 }
 
 // requestConnectionForDevice returns a connection to the given device, to
@@ -2559,7 +2562,7 @@ func (m *model) DelayScan(folder string, next time.Duration) {
 func (m *model) numHashers(folder string) int {
 	m.mut.RLock()
 	folderCfg := m.folderCfgs[folder]
-	numFolders := len(m.folderCfgs)
+	numFolders := max(1, len(m.folderCfgs))
 	m.mut.RUnlock()
 
 	if folderCfg.Hashers > 0 {
@@ -2585,14 +2588,14 @@ func (m *model) numHashers(folder string) int {
 
 // generateClusterConfig returns a ClusterConfigMessage that is correct and the
 // set of folder passwords for the given peer device
-func (m *model) generateClusterConfig(device protocol.DeviceID) (protocol.ClusterConfig, map[string]string) {
+func (m *model) generateClusterConfig(device protocol.DeviceID) (*protocol.ClusterConfig, map[string]string) {
 	m.mut.RLock()
 	defer m.mut.RUnlock()
 	return m.generateClusterConfigRLocked(device)
 }
 
-func (m *model) generateClusterConfigRLocked(device protocol.DeviceID) (protocol.ClusterConfig, map[string]string) {
-	var message protocol.ClusterConfig
+func (m *model) generateClusterConfigRLocked(device protocol.DeviceID) (*protocol.ClusterConfig, map[string]string) {
+	message := &protocol.ClusterConfig{}
 	folders := m.cfg.FolderList()
 	passwords := make(map[string]string, len(folders))
 	for _, folderCfg := range folders {
