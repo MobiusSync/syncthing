@@ -1,6 +1,7 @@
 module github.com/syncthing/syncthing
 
 go 1.22.0
+toolchain go1.24.1
 
 require (
 	github.com/AudriusButkevicius/recli v0.0.7-0.20220911121932-d000ce8fbf0f
@@ -42,7 +43,7 @@ require (
 	golang.org/x/crypto v0.31.0
 	golang.org/x/net v0.33.0
 	golang.org/x/sys v0.28.0
-	golang.org/x/text v0.21.0
+	golang.org/x/text v0.23.0
 	golang.org/x/time v0.8.0
 	golang.org/x/tools v0.28.0
 	google.golang.org/protobuf v1.36.1
@@ -92,7 +93,7 @@ require (
 	go.uber.org/mock v0.4.0 // indirect
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
 	golang.org/x/mod v0.22.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
+	golang.org/x/sync v0.12.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
