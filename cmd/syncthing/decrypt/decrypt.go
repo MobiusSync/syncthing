@@ -17,6 +17,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/gen/bep"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
@@ -164,7 +167,7 @@ func (c *CLI) process(srcFs fs.Filesystem, dstFs fs.Filesystem, path string) err
 
 	var plainFd fs.File
 	if dstFs != nil {
-		if err := dstFs.MkdirAll(filepath.Dir(plainFi.Name), 0o700); err != nil {
+		if err := dstFs.MkdirAll(filepath.Dir(plainFi.Name), fs.ModePerm); err != nil {
 			return fmt.Errorf("%s: %w", plainFi.Name, err)
 		}
 
@@ -235,7 +238,7 @@ func (c *CLI) decryptFile(encFi *protocol.FileInfo, plainFi *protocol.FileInfo, 
 		}
 
 		// Verify the hash against the plaintext block info
-		if !scanner.Validate(dec, plainBlock.Hash, 0) {
+		if !scanner.Validate(dec, plainBlock.Hash) {
 			// The block decrypted correctly but fails the hash check. This
 			// is odd and unexpected, but it it's still a valid block from
 			// the source. The file might have changed while we pulled it?
@@ -280,10 +283,11 @@ func loadEncryptedFileInfo(fd fs.File) (*protocol.FileInfo, error) {
 		return nil, err
 	}
 
-	var encFi protocol.FileInfo
-	if err := encFi.Unmarshal(trailer); err != nil {
+	var encFi bep.FileInfo
+	if err := proto.Unmarshal(trailer, &encFi); err != nil {
 		return nil, err
 	}
+	fi := protocol.FileInfoFromWire(&encFi)
 
-	return &encFi, nil
+	return &fi, nil
 }

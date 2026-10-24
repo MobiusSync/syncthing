@@ -8,10 +8,36 @@ package config
 
 import (
 	"fmt"
-	"sort"
+	"log/slog"
+	"slices"
+
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-const defaultNumConnections = 1 // number of connections to use by default; may change in the future.
+const defaultNumConnections = 3 // number of connections to use by default
+
+type DeviceConfiguration struct {
+	DeviceID                 protocol.DeviceID `json:"deviceID" xml:"id,attr" nodefault:"true"`
+	Name                     string            `json:"name" xml:"name,attr,omitempty"`
+	Addresses                []string          `json:"addresses" xml:"address,omitempty"`
+	Compression              Compression       `json:"compression" xml:"compression,attr"`
+	CertName                 string            `json:"certName" xml:"certName,attr,omitempty"`
+	Introducer               bool              `json:"introducer" xml:"introducer,attr"`
+	SkipIntroductionRemovals bool              `json:"skipIntroductionRemovals" xml:"skipIntroductionRemovals,attr"`
+	IntroducedBy             protocol.DeviceID `json:"introducedBy" xml:"introducedBy,attr" nodefault:"true"`
+	Paused                   bool              `json:"paused" xml:"paused"`
+	AllowedNetworks          []string          `json:"allowedNetworks" xml:"allowedNetwork,omitempty"`
+	AutoAcceptFolders        bool              `json:"autoAcceptFolders" xml:"autoAcceptFolders"`
+	MaxSendKbps              int               `json:"maxSendKbps" xml:"maxSendKbps"`
+	MaxRecvKbps              int               `json:"maxRecvKbps" xml:"maxRecvKbps"`
+	IgnoredFolders           []ObservedFolder  `json:"ignoredFolders" xml:"ignoredFolder"`
+	DeprecatedPendingFolders []ObservedFolder  `json:"-" xml:"pendingFolder,omitempty"` // Deprecated: Do not use.
+	MaxRequestKiB            int               `json:"maxRequestKiB" xml:"maxRequestKiB"`
+	Untrusted                bool              `json:"untrusted" xml:"untrusted"`
+	RemoteGUIPort            int               `json:"remoteGUIPort" xml:"remoteGUIPort"`
+	RawNumConnections        int               `json:"numConnections" xml:"numConnections"`
+	Group                    string            `json:"group" xml:"group,attr,omitempty"`
+}
 
 func (cfg DeviceConfiguration) Copy() DeviceConfiguration {
 	c := cfg
@@ -41,11 +67,11 @@ func (cfg *DeviceConfiguration) prepare(sharedFolders []string) {
 	// auto accept folders.
 	if cfg.Untrusted {
 		if cfg.Introducer {
-			l.Warnf("Device %s (%s) is both untrusted and an introducer, removing introducer flag", cfg.DeviceID.Short(), cfg.Name)
+			slog.Warn("Device is both untrusted and an introducer, removing introducer flag", cfg.DeviceID.LogAttr())
 			cfg.Introducer = false
 		}
 		if cfg.AutoAcceptFolders {
-			l.Warnf("Device %s (%s) is both untrusted and auto-accepting folders, removing auto-accept flag", cfg.DeviceID.Short(), cfg.Name)
+			slog.Warn("Device is both untrusted and auto-accepting folders, removing auto-accept flag", cfg.DeviceID.LogAttr())
 			cfg.AutoAcceptFolders = false
 		}
 	}
@@ -76,8 +102,8 @@ func sortedObservedFolderSlice(input map[string]ObservedFolder) []ObservedFolder
 	for _, folder := range input {
 		output = append(output, folder)
 	}
-	sort.Slice(output, func(i, j int) bool {
-		return output[i].Time.Before(output[j].Time)
+	slices.SortFunc(output, func(a, b ObservedFolder) int {
+		return a.Time.Compare(b.Time)
 	})
 	return output
 }

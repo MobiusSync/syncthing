@@ -15,9 +15,27 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/rand"
 )
+
+type GUIConfiguration struct {
+	Enabled                   bool     `json:"enabled" xml:"enabled,attr" default:"true"`
+	RawAddress                string   `json:"address" xml:"address" default:"127.0.0.1:8384"`
+	RawUnixSocketPermissions  string   `json:"unixSocketPermissions" xml:"unixSocketPermissions,omitempty"`
+	User                      string   `json:"user" xml:"user,omitempty"`
+	Password                  string   `json:"password" xml:"password,omitempty"`
+	AuthMode                  AuthMode `json:"authMode" xml:"authMode,omitempty"`
+	MetricsWithoutAuth        bool     `json:"metricsWithoutAuth" xml:"metricsWithoutAuth" default:"false"`
+	RawUseTLS                 bool     `json:"useTLS" xml:"tls,attr"`
+	APIKey                    string   `json:"apiKey" xml:"apikey,omitempty"`
+	InsecureAdminAccess       bool     `json:"insecureAdminAccess" xml:"insecureAdminAccess,omitempty"`
+	Theme                     string   `json:"theme" xml:"theme" default:"default"`
+	InsecureSkipHostCheck     bool     `json:"insecureSkipHostcheck" xml:"insecureSkipHostcheck,omitempty"`
+	InsecureAllowFrameLoading bool     `json:"insecureAllowFrameLoading" xml:"insecureAllowFrameLoading,omitempty"`
+	SendBasicAuthPrompt       bool     `json:"sendBasicAuthPrompt" xml:"sendBasicAuthPrompt,attr"`
+	SessionCookieDurationS    int      `json:"sessionCookieDurationS" xml:"sessionCookieDurationS,omitempty" default:"604800"`
+	SessionCookiePath         string   `json:"sessionCookiePath" xml:"sessionCookiePath,omitempty" default:"/"`
+}
 
 func (c GUIConfiguration) IsAuthEnabled() bool {
 	// This function should match isAuthEnabled() in syncthingController.js
@@ -83,10 +101,6 @@ func (c GUIConfiguration) UseTLS() bool {
 }
 
 func (c GUIConfiguration) URL() string {
-	if override := os.Getenv("STGUIADDRESS"); override != "" {
-		return override
-	}
-
 	if c.Network() == "unix" {
 		if c.UseTLS() {
 			return "unixs://" + c.Address()
@@ -107,9 +121,8 @@ func (c GUIConfiguration) URL() string {
 	if strings.HasPrefix(u.Host, ":") {
 		// Empty host, i.e. ":port", use IPv4 localhost
 		u.Host = "127.0.0.1" + u.Host
-	} else if strings.HasPrefix(u.Host, "0.0.0.0:") && !build.IsIOS {
+	} else if strings.HasPrefix(u.Host, "0.0.0.0:") {
 		// IPv4 all zeroes host, convert to IPv4 localhost
-		// Unless we are on iOS, keep it open to allow testing on host Mac (FIXME)
 		u.Host = "127.0.0.1" + u.Host[7:]
 	} else if strings.HasPrefix(u.Host, "[::]:") {
 		// IPv6 all zeroes host, convert to IPv6 localhost
@@ -164,6 +177,12 @@ func (c GUIConfiguration) IsValidAPIKey(apiKey string) bool {
 func (c *GUIConfiguration) prepare() {
 	if c.APIKey == "" {
 		c.APIKey = rand.String(32)
+	}
+	if path := strings.TrimSpace(c.SessionCookiePath); path != "" {
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		c.SessionCookiePath = path
 	}
 }
 

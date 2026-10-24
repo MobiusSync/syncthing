@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
-
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
@@ -58,7 +58,7 @@ func TestSimpleVersioningVersionCount(t *testing.T) {
 	dir := t.TempDir()
 
 	cfg := config.FolderConfiguration{
-		FilesystemType: fs.FilesystemTypeBasic,
+		FilesystemType: config.FilesystemTypeBasic,
 		Path:           dir,
 		Versioning: config.VersioningConfiguration{
 			Params: map[string]string{
@@ -66,7 +66,7 @@ func TestSimpleVersioningVersionCount(t *testing.T) {
 			},
 		},
 	}
-	fs := cfg.Filesystem(nil)
+	fs := cfg.Filesystem()
 
 	v := newSimple(cfg)
 
@@ -108,17 +108,17 @@ func TestPathTildes(t *testing.T) {
 	os.Mkdir(filepath.Join(home, "folder"), 0o755)
 
 	cfg := config.FolderConfiguration{
-		FilesystemType: fs.FilesystemTypeBasic,
+		FilesystemType: config.FilesystemTypeBasic,
 		Path:           "~/folder",
 		Versioning: config.VersioningConfiguration{
 			FSPath: "~/versions",
-			FSType: fs.FilesystemTypeBasic,
+			FSType: config.FilesystemTypeBasic,
 			Params: map[string]string{
 				"keep": "2",
 			},
 		},
 	}
-	fs := cfg.Filesystem(nil)
+	fs := cfg.Filesystem()
 	v := newSimple(cfg)
 
 	const testPath = "test"
@@ -156,5 +156,158 @@ func TestPathTildes(t *testing.T) {
 	}
 	if got := names[0]; !strings.HasPrefix(got, testPath) {
 		t.Fatalf("found versioned file %q, want one that begins with %q", got, testPath)
+	}
+}
+
+func TestArchiveFoldersCreationPermission(t *testing.T) {
+	if build.IsWindows {
+		t.Skip("Skipping on Windows")
+		return
+	}
+	dir := t.TempDir()
+	versionsDir := t.TempDir()
+
+	cfg := config.FolderConfiguration{
+		FilesystemType: config.FilesystemTypeBasic,
+		Path:           dir,
+		Versioning: config.VersioningConfiguration{
+			FSPath: versionsDir,
+			FSType: config.FilesystemTypeBasic,
+			Params: map[string]string{
+				"keep": "2",
+			},
+		},
+	}
+	vfs := cfg.Filesystem()
+	v := newSimple(cfg)
+
+	// Create two folders and set their permissions
+	folder1Path := filepath.Join(dir, "folder1")
+	folder1Perms := os.FileMode(0o777)
+	folder1VersionsPath := filepath.Join(versionsDir, "folder1")
+	err := os.Mkdir(folder1Path, folder1Perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// chmod incase umask changes the create permissions
+	err = os.Chmod(folder1Path, folder1Perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	folder2Path := filepath.Join(folder1Path, "földer2")
+	folder2VersionsPath := filepath.Join(folder1VersionsPath, "földer2")
+	folder2Perms := os.FileMode(0o744)
+	err = os.Mkdir(folder2Path, folder2Perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// chmod incase umask changes the create permissions
+	err = os.Chmod(folder2Path, folder2Perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create a file
+	filePath := filepath.Join("folder1", "földer2", "testFile")
+	f, err := vfs.Create(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if err := v.Archive(filePath); err != nil {
+		t.Error(err)
+	}
+
+	// check permissions of the created version folders
+	folder1VersionsInfo, err := os.Stat(folder1VersionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folder1VersionsInfo.Mode().Perm() != folder1Perms {
+		t.Errorf("folder1 permissions %v, want %v", folder1VersionsInfo.Mode(), folder1Perms)
+	}
+
+	folder2VersionsInfo, err := os.Stat(folder2VersionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folder2VersionsInfo.Mode().Perm() != folder2Perms {
+		t.Errorf("földer2 permissions %v, want %v", folder2VersionsInfo.Mode(), folder2Perms)
+	}
+
+	// Archive again to test that archiving doesn't fail if the versioned folders already exist
+	if err := v.Archive(filePath); err != nil {
+		t.Error(err)
+	}
+	folder1VersionsInfo, err = os.Stat(folder1VersionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folder1VersionsInfo.Mode().Perm() != folder1Perms {
+		t.Errorf("folder1 permissions %v, want %v", folder1VersionsInfo.Mode(), folder1Perms)
+	}
+
+	folder2VersionsInfo, err = os.Stat(folder2VersionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folder2VersionsInfo.Mode().Perm() != folder2Perms {
+		t.Errorf("földer2 permissions %v, want %v", folder2VersionsInfo.Mode(), folder2Perms)
+	}
+}
+
+func TestDupDirTreeWritePermissions(t *testing.T) {
+	// The structure should be replicated, with user permission bits set along the way
+
+	srcFs := fs.NewFilesystem(fs.FilesystemTypeFake, "TestDupDirTreeWritePermissions/srcFs")
+	dstFs := fs.NewFilesystem(fs.FilesystemTypeFake, "TestDupDirTreeWritePermissions/dstFs")
+
+	// A source dir to duplicate
+	_ = srcFs.Mkdir("foo", 0o444)
+	_ = srcFs.Mkdir("foo/bar", 0o555)
+	_ = srcFs.Mkdir("foo/bar/baz", 0o000)
+
+	// Duplication should succeed
+	if err := dupDirTree(srcFs, dstFs, "foo/bar/baz"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Permissions should be the same, but with read/write/execute bits for
+	// the user
+	if info, err := dstFs.Lstat("foo"); err != nil || info.Mode() != 0o744 {
+		t.Fatalf("foo: 0o%o", info.Mode())
+	}
+	if info, err := dstFs.Lstat("foo/bar"); err != nil || info.Mode() != 0o755 {
+		t.Fatalf("foo/bar: 0o%o", info.Mode())
+	}
+	if info, err := dstFs.Lstat("foo/bar/baz"); err != nil || info.Mode() != 0o700 {
+		t.Fatalf("foo/bar/baz: 0o%o", info.Mode())
+	}
+}
+
+func TestDupDirFastPath(t *testing.T) {
+	srcFs := fs.NewFilesystem(fs.FilesystemTypeFake, "TestDupDirFastPath/srcFs")
+	dstFs := fs.NewFilesystem(fs.FilesystemTypeFake, "TestDupDirFastPath/dstFs")
+
+	// A source dir to duplicate
+	_ = srcFs.Mkdir("foo", 0o444)
+	_ = srcFs.Mkdir("foo/bar", 0o555)
+	_ = srcFs.Mkdir("foo/bar/baz", 0o000)
+
+	// The destination exists, but with too few permission bits
+	_ = dstFs.MkdirAll("foo/bar/baz", 0o555)
+
+	// Duplication should succeed
+	if err := dupDirTree(srcFs, dstFs, "foo/bar/baz"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Permissions for the destination should have been updated. (This
+	// differs from what would have been created by the duplication of the
+	// 0o000 dir in the src, because it already existed.)
+	if info, err := dstFs.Lstat("foo/bar/baz"); err != nil || info.Mode() != 0o755 {
+		t.Fatalf("foo/bar/baz: 0o%o", info.Mode())
 	}
 }

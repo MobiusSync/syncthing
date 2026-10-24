@@ -26,7 +26,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -53,11 +52,9 @@ func main() {
 	// Run one certificate generator per CPU core.
 	var wg sync.WaitGroup
 	for i := 0; i < runtime.GOMAXPROCS(-1); i++ {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			generatePrefixed(prefix, &count, found, stop)
-			wg.Done()
-		}()
+		})
 	}
 
 	// Save the result, when one has been found.
@@ -141,7 +138,7 @@ func printProgress(prefix string, count *atomic.Int64) {
 	}
 }
 
-func saveCert(priv interface{}, derBytes []byte) {
+func saveCert(priv any, derBytes []byte) {
 	certOut, err := os.Create("cert.pem")
 	if err != nil {
 		fmt.Println(err)
@@ -182,7 +179,7 @@ func saveCert(priv interface{}, derBytes []byte) {
 	}
 }
 
-func pemBlockForKey(priv interface{}) (*pem.Block, error) {
+func pemBlockForKey(priv any) (*pem.Block, error) {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		return &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}, nil

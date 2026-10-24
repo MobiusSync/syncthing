@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -17,13 +18,15 @@ import (
 	"unicode/utf8"
 
 	metrics "github.com/rcrowley/go-metrics"
+	"golang.org/x/text/unicode/norm"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"golang.org/x/text/unicode/norm"
 )
 
 type Config struct {
@@ -53,7 +56,7 @@ type Config struct {
 	// events are emitted. Negative number means disabled.
 	ProgressTickIntervalS int
 	// Local flags to set on scanned files
-	LocalFlags uint32
+	LocalFlags protocol.FlagLocal
 	// Modification time is to be considered unchanged if the difference is lower.
 	ModTimeWindow time.Duration
 	// Event logger to which the scan progress events are sent
@@ -178,7 +181,7 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 				current := progress.Total()
 				rate := progress.Rate()
 				l.Debugf("%v: Walk %s %s current progress %d/%d at %.01f MiB/s (%d%%)", w, w.Folder, w.Subs, current, total, rate/1024/1024, current*100/total)
-				w.EventLogger.Log(events.FolderScanProgress, map[string]interface{}{
+				w.EventLogger.Log(events.FolderScanProgress, map[string]any{
 					"folder":  w.Folder,
 					"current": current,
 					"total":   total,
@@ -237,20 +240,49 @@ func (w *walker) walkWithoutHashing(ctx context.Context) chan ScanResult {
 	return finishedChan
 }
 
+const walkFailureEventDesc = "Unexpected error while walking the filesystem during scan"
+
 func (w *walker) scan(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) {
 	hashFiles := w.walkAndHashFiles(ctx, toHashChan, finishedChan)
 	if len(w.Subs) == 0 {
-		w.Filesystem.Walk(".", hashFiles)
+		if err := w.Filesystem.Walk(".", hashFiles); isWarnableError(err) {
+			w.EventLogger.Log(events.Failure, walkFailureEventDesc)
+			slog.ErrorContext(ctx, "Aborted scan due to an unexpected error", slogutil.Error(err))
+		}
 	} else {
 		for _, sub := range w.Subs {
 			if err := osutil.TraversesSymlink(w.Filesystem, filepath.Dir(sub)); err != nil {
 				l.Debugf("%v: Skip walking %v as it is below a symlink", w, sub)
 				continue
 			}
-			w.Filesystem.Walk(sub, hashFiles)
+			if err := w.Filesystem.Walk(sub, hashFiles); isWarnableError(err) {
+				w.EventLogger.Log(events.Failure, walkFailureEventDesc)
+				slog.ErrorContext(ctx, "Aborted scan due to an unexpected error", slogutil.FilePath(sub), slogutil.Error(err))
+			}
 		}
 	}
 	close(toHashChan)
+}
+
+// isWarnableError returns true if err is a kind of error we should warn
+// about receiving from the folder walk.
+func isWarnableError(err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, fs.SkipDir):
+		// intentional skip
+		return false
+	case errors.Is(err, context.Canceled):
+		// folder restarting
+		return false
+	case fs.IsNotExist(err):
+		// sudden does-not-exist is fine for deleted files, deleted folder
+		// root triggers health check error instead
+		return false
+	default:
+		return true
+	}
 }
 
 func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) fs.WalkFunc {
@@ -340,7 +372,11 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 
 		if ignoredParent == "" {
 			// parent isn't ignored, nothing special
-			return w.handleItem(ctx, path, info, toHashChan, finishedChan)
+			if err := w.handleItem(ctx, path, info, toHashChan, finishedChan); err != nil {
+				handleError(ctx, "scan", path, err, finishedChan)
+				return skip
+			}
+			return nil
 		}
 
 		// Part of current path below the ignored (potential) parent
@@ -349,7 +385,11 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 		// ignored path isn't actually a parent of the current path
 		if rel == path {
 			ignoredParent = ""
-			return w.handleItem(ctx, path, info, toHashChan, finishedChan)
+			if err := w.handleItem(ctx, path, info, toHashChan, finishedChan); err != nil {
+				handleError(ctx, "scan", path, err, finishedChan)
+				return skip
+			}
+			return nil
 		}
 
 		// The previously ignored parent directories of the current, not
@@ -365,7 +405,8 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 				return skip
 			}
 			if err = w.handleItem(ctx, ignoredParent, info, toHashChan, finishedChan); err != nil {
-				return err
+				handleError(ctx, "scan", path, err, finishedChan)
+				return skip
 			}
 		}
 		ignoredParent = ""
@@ -374,6 +415,9 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 	}
 }
 
+// Returning an error does not indicate that the walk should be aborted - it
+// will simply report the error for that path to the user (same for walk...
+// functions called from here).
 func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) error {
 	switch {
 	case info.IsSymlink():
@@ -391,9 +435,12 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, 
 
 	case info.IsRegular():
 		return w.walkRegular(ctx, path, info, toHashChan)
-	}
 
-	return fmt.Errorf("bug: file info for %v is neither symlink, dir nor regular", path)
+	default:
+		// A special file, socket, fifo, etc. -- do nothing, just skip and continue scanning.
+		l.Debugf("Skipping non-regular file %s (%s)", path, info.Mode())
+		return nil
+	}
 }
 
 func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo) error {
@@ -421,8 +468,10 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 	}
 	f = w.updateFileInfo(f, curFile)
 	f.NoPermissions = w.IgnorePerms
-	f.RawBlockSize = blockSize
+	f.RawBlockSize = int32(blockSize)
 	l.Debugln(w, "checking:", f)
+
+	f.New = !hasCurFile
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
@@ -471,6 +520,8 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 	f.NoPermissions = w.IgnorePerms
 	l.Debugln(w, "checking:", f)
 
+	f.New = !hasCurFile
+
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
 			ModTimeWindow:   w.ModTimeWindow,
@@ -507,8 +558,6 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 	return nil
 }
 
-// walkSymlink returns nil or an error, if the error is of the nature that
-// it should stop the entire walk.
 func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
 	// Symlinks are not supported on Windows. We ignore instead of returning
 	// an error.
@@ -518,13 +567,14 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
 
 	f, err := CreateFileInfo(info, relPath, w.Filesystem, w.ScanOwnership, w.ScanXattrs, w.XattrFilter)
 	if err != nil {
-		handleError(ctx, "reading link", relPath, err, finishedChan)
-		return nil
+		return err
 	}
 
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 	f = w.updateFileInfo(f, curFile)
 	l.Debugln(w, "checking:", f)
+
+	f.New = !hasCurFile
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
@@ -584,7 +634,7 @@ func (w *walker) applyNormalization(path, normPath string, info fs.FileInfo) (st
 		if err = w.Filesystem.Rename(path, normPath); err != nil {
 			return "", err
 		}
-		l.Infof(`Normalized UTF8 encoding of file name "%s".`, path)
+		slog.Info("Normalized UTF8 encoding of file name", slogutil.FilePath(path))
 		return normPath, nil
 	}
 	if w.Filesystem.SameFile(info, normInfo) {
@@ -602,7 +652,7 @@ func (w *walker) applyNormalization(path, normPath string, info fs.FileInfo) (st
 		if err = w.Filesystem.Rename(tempPath, normPath); err != nil {
 			// I don't ever expect this to happen, but if it does, we should probably tell our caller that the normalized
 			// path is the temp path: that way at least the user's data still gets synced.
-			l.Warnf(`Error renaming "%s" to "%s" while normalizating UTF8 encoding: %v. You will want to rename this file back manually`, tempPath, normPath, err)
+			slog.Error("Failed to rename while normalizating UTF8 encoding; please rename temp file manually", slog.String("from", tempPath), slog.String("to", normPath), slogutil.Error(err))
 			return tempPath, nil
 		}
 		return normPath, nil
@@ -624,6 +674,7 @@ func (w *walker) updateFileInfo(dst, src protocol.FileInfo) protocol.FileInfo {
 	dst.Version = src.Version.Update(w.ShortID)
 	dst.ModifiedBy = w.ShortID
 	dst.LocalFlags = w.LocalFlags
+	dst.PreviousBlocksHash = src.BlocksHash
 
 	// Copy OS data from src to dst, unless it was already set on dst.
 	dst.Platform.MergeWith(&src.Platform)
@@ -632,6 +683,7 @@ func (w *walker) updateFileInfo(dst, src protocol.FileInfo) protocol.FileInfo {
 }
 
 func handleError(ctx context.Context, context, path string, err error, finishedChan chan<- ScanResult) {
+	l.Debugf("handle error on '%v': %v: %v", path, context, err)
 	select {
 	case finishedChan <- ScanResult{
 		Err:  fmt.Errorf("%s: %w", context, err),
@@ -648,9 +700,10 @@ func (w *walker) String() string {
 // A byteCounter gets bytes added to it via Update() and then provides the
 // Total() and one minute moving average Rate() in bytes per second.
 type byteCounter struct {
-	total atomic.Int64
 	metrics.EWMA
-	stop chan struct{}
+
+	total atomic.Int64
+	stop  chan struct{}
 }
 
 func newByteCounter() *byteCounter {
@@ -706,26 +759,20 @@ func CreateFileInfo(fi fs.FileInfo, name string, filesystem fs.Filesystem, scanO
 		}
 	}
 
-	if ct := fi.InodeChangeTime(); !ct.IsZero() {
-		f.InodeChangeNs = ct.UnixNano()
-	} else {
-		f.InodeChangeNs = 0
-	}
-
 	if fi.IsSymlink() {
 		f.Type = protocol.FileInfoTypeSymlink
 		target, err := filesystem.ReadSymlink(name)
 		if err != nil {
 			return protocol.FileInfo{}, err
 		}
-		f.SymlinkTarget = target
+		f.SymlinkTarget = []byte(target)
 		f.NoPermissions = true // Symlinks don't have permissions of their own
 		return f, nil
 	}
 
 	f.Permissions = uint32(fi.Mode() & fs.ModePerm)
 	f.ModifiedS = fi.ModTime().Unix()
-	f.ModifiedNs = fi.ModTime().Nanosecond()
+	f.ModifiedNs = int32(fi.ModTime().Nanosecond())
 
 	if fi.IsDir() {
 		f.Type = protocol.FileInfoTypeDirectory

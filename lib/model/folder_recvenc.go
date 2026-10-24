@@ -7,11 +7,13 @@
 package model
 
 import (
+	"context"
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 
+	"github.com/syncthing/syncthing/internal/itererr"
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
@@ -28,8 +30,8 @@ type receiveEncryptedFolder struct {
 	*sendReceiveFolder
 }
 
-func newReceiveEncryptedFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
-	f := &receiveEncryptedFolder{newSendReceiveFolder(model, fset, ignores, cfg, ver, evLogger, ioLimiter).(*sendReceiveFolder)}
+func newReceiveEncryptedFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
+	f := &receiveEncryptedFolder{newSendReceiveFolder(model, ignores, cfg, ver, evLogger, ioLimiter).(*sendReceiveFolder)}
 	f.localFlags = protocol.FlagLocalReceiveOnly // gets propagated to the scanner, and set on locally changed files
 	return f
 }
@@ -38,44 +40,39 @@ func (f *receiveEncryptedFolder) Revert() {
 	f.doInSync(f.revert)
 }
 
-func (f *receiveEncryptedFolder) revert() error {
-	l.Infof("Reverting unexpected items in folder %v (receive-encrypted)", f.Description())
+func (f *receiveEncryptedFolder) revert(ctx context.Context) error {
+	f.sl.InfoContext(ctx, "Reverting unexpected items")
 
 	f.setState(FolderScanning)
-	defer f.setState(FolderIdle)
 
-	batch := db.NewFileInfoBatch(func(fs []protocol.FileInfo) error {
+	batch := NewFileInfoBatch(func(fs []protocol.FileInfo) error {
 		f.updateLocalsFromScanning(fs)
 		return nil
 	})
 
-	snap, err := f.dbSnapshot()
-	if err != nil {
-		return err
-	}
-	defer snap.Release()
-	var iterErr error
 	var dirs []string
-	snap.WithHaveTruncated(protocol.LocalDeviceID, func(intf protocol.FileIntf) bool {
-		if iterErr = batch.FlushIfFull(); iterErr != nil {
-			return false
+	for fi, err := range itererr.Zip(f.db.AllLocalFiles(f.folderID, protocol.LocalDeviceID)) {
+		if err != nil {
+			return err
+		}
+		if err := batch.FlushIfFull(); err != nil {
+			return err
 		}
 
-		fit := intf.(db.FileInfoTruncated)
-		if !fit.IsReceiveOnlyChanged() || intf.IsDeleted() {
-			return true
+		if !fi.IsReceiveOnlyChanged() || fi.IsDeleted() {
+			continue
 		}
 
-		if fit.IsDirectory() {
-			dirs = append(dirs, fit.Name)
-			return true
+		if fi.IsDirectory() {
+			dirs = append(dirs, fi.Name)
+			continue
 		}
 
-		if err := f.inWritableDir(f.mtimefs.Remove, fit.Name); err != nil && !fs.IsNotExist(err) {
-			f.newScanError(fit.Name, fmt.Errorf("deleting unexpected item: %w", err))
+		if err := f.inWritableDir(f.mtimefs.Remove, fi.Name); err != nil && !fs.IsNotExist(err) {
+			f.newScanError(fi.Name, fmt.Errorf("deleting unexpected item: %w", err))
 		}
 
-		fi := fit.ConvertToDeletedFileInfo(f.shortID)
+		fi.SetDeleted(f.shortID)
 		// Set version to zero, such that we pull the global version in case
 		// this is a valid filename that was erroneously changed locally.
 		// Should already be zero from scanning, but lets be safe.
@@ -85,15 +82,10 @@ func (f *receiveEncryptedFolder) revert() error {
 		// deleted, it will not show up as an unexpected file in the UI
 		// anymore.
 		batch.Append(fi)
-
-		return true
-	})
-
-	f.revertHandleDirs(dirs, snap)
-
-	if iterErr != nil {
-		return iterErr
 	}
+
+	f.revertHandleDirs(ctx, dirs)
+
 	if err := batch.Flush(); err != nil {
 		return err
 	}
@@ -104,18 +96,20 @@ func (f *receiveEncryptedFolder) revert() error {
 	return nil
 }
 
-func (f *receiveEncryptedFolder) revertHandleDirs(dirs []string, snap *db.Snapshot) {
+func (f *receiveEncryptedFolder) revertHandleDirs(ctx context.Context, dirs []string) {
 	if len(dirs) == 0 {
 		return
 	}
 
 	scanChan := make(chan string)
-	go f.pullScannerRoutine(scanChan)
+	go f.pullScannerRoutine(ctx, scanChan)
 	defer close(scanChan)
 
-	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+	slices.SortFunc(dirs, func(a, b string) int {
+		return strings.Compare(b, a)
+	})
 	for _, dir := range dirs {
-		if err := f.deleteDirOnDisk(dir, snap, scanChan); err != nil {
+		if err := f.deleteDirOnDisk(dir, scanChan); err != nil {
 			f.newScanError(dir, fmt.Errorf("deleting unexpected dir: %w", err))
 		}
 		scanChan <- dir

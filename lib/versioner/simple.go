@@ -8,7 +8,7 @@ package versioner
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -30,7 +30,7 @@ type simple struct {
 }
 
 func newSimple(cfg config.FolderConfiguration) Versioner {
-	var keep, err = strconv.Atoi(cfg.Versioning.Params["keep"])
+	keep, err := strconv.Atoi(cfg.Versioning.Params["keep"])
 	cleanoutDays, _ := strconv.Atoi(cfg.Versioning.Params["cleanoutDays"])
 	// On error we default to 0, "do not clean out the versioned items"
 
@@ -41,9 +41,9 @@ func newSimple(cfg config.FolderConfiguration) Versioner {
 	s := simple{
 		keep:            keep,
 		cleanoutDays:    cleanoutDays,
-		folderFs:        cfg.Filesystem(nil),
+		folderFs:        cfg.Filesystem(),
 		versionsFs:      versionerFsFromFolderCfg(cfg),
-		copyRangeMethod: cfg.CopyRangeMethod,
+		copyRangeMethod: cfg.CopyRangeMethod.ToFS(),
 	}
 
 	l.Debugf("instantiated %#v", s)
@@ -79,7 +79,7 @@ func (v simple) toRemove(versions []string, now time.Time) []string {
 	var remove []string
 
 	// The list of versions may or may not be properly sorted.
-	sort.Strings(versions)
+	slices.Sort(versions)
 
 	// If the amount of elements exceeds the limit: the oldest elements are to be removed.
 	if len(versions) > v.keep {

@@ -5,14 +5,13 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build linux || darwin
-// +build linux darwin
 
 package fs
 
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -38,6 +37,6 @@ func listXattr(path string) ([]string, error) {
 	buf = buf[:size]
 	attrs := compact(strings.Split(string(buf), "\x00"))
 
-	sort.Strings(attrs)
+	slices.Sort(attrs)
 	return attrs, nil
 }

@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build windows
-// +build windows
 
 package fs
 
@@ -32,7 +31,7 @@ func readReparseTag(path string) (uint32, error) {
 	}
 	defer syscall.CloseHandle(h)
 
-	//https://docs.microsoft.com/windows/win32/api/winbase/ns-winbase-file_attribute_tag_info
+	// https://docs.microsoft.com/windows/win32/api/winbase/ns-winbase-file_attribute_tag_info
 	const fileAttributeTagInfo = 9
 	type FILE_ATTRIBUTE_TAG_INFO struct {
 		FileAttributes uint32
@@ -67,7 +66,7 @@ type dirJunctFileInfo struct {
 func (fi *dirJunctFileInfo) Mode() os.FileMode {
 	// Simulate a directory and not a symlink; also set the execute
 	// bits so the directory can be traversed Unix-side.
-	return fi.FileInfo.Mode() ^ junctionPointModeMask | os.ModeDir | 0111
+	return fi.FileInfo.Mode()&^junctionPointModeMask | os.ModeDir | 0o111
 }
 
 func (fi *dirJunctFileInfo) IsDir() bool {
@@ -77,16 +76,19 @@ func (fi *dirJunctFileInfo) IsDir() bool {
 var junctionPointModeMask os.FileMode
 
 func init() {
+	// Per https://tip.golang.org/doc/go1.23#minor_library_changes
+	// In go1.22 (and go1.23 when GODEBUG=winsymlink=0) Windows' directory
+	// junctions (aka "mount points") always have ModeSymlink set.
 	junctionPointModeMask = os.ModeSymlink
 	if version.Compare(runtime.Version(), "go1.23") >= 0 {
-		// if GODEBUG=winsymlink=0, then we are in g1.22 mode so let's check for
-		// os.ModeSymlink as well, as it can't hurt.
+		// In go1.23 Windows' directory junctions always have ModeIrregular set
+		// (unless GODEBUG=winsymlink=0).
 		junctionPointModeMask |= os.ModeIrregular
 	}
 }
 
 func (f *BasicFilesystem) underlyingLstat(name string) (os.FileInfo, error) {
-	var fi, err = os.Lstat(name)
+	fi, err := os.Lstat(name)
 
 	// There are cases where files are tagged as symlink, but they end up being
 	// something else. Make sure we properly handle those types.

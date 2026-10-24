@@ -10,48 +10,57 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/protoutil"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 // A sharedPullerState is kept for each file that is being synced and is kept
 // updated along the way.
 type sharedPullerState struct {
 	// Immutable, does not require locking
-	file        protocol.FileInfo // The new file (desired end state)
-	fs          fs.Filesystem
-	folder      string
-	tempName    string
-	realName    string
-	reused      int // Number of blocks reused from temporary file
-	ignorePerms bool
-	hasCurFile  bool              // Whether curFile is set
-	curFile     protocol.FileInfo // The file as it exists now in our database
-	sparse      bool
-	created     time.Time
-	fsync       bool
+	file          protocol.FileInfo // The new file (desired end state)
+	fs            fs.Filesystem
+	folder        string
+	tempName      string
+	realName      string
+	reused        int // Number of blocks reused from temporary file
+	ignorePerms   bool
+	hasCurFile    bool              // Whether curFile is set
+	curFile       protocol.FileInfo // The file as it exists now in our database
+	curFileBlocks map[string]int    // block hash to index in curFile
+	sparse        bool
+	created       time.Time
+	fsync         bool
 
 	// Mutable, must be locked for access
-	err               error           // The first error we hit
-	writer            *lockedWriterAt // Wraps fd to prevent fd closing at the same time as writing
-	copyTotal         int             // Total number of copy actions for the whole job
-	pullTotal         int             // Total number of pull actions for the whole job
-	copyOrigin        int             // Number of blocks copied from the original file
-	copyOriginShifted int             // Number of blocks copied from the original file but shifted
-	copyNeeded        int             // Number of copy actions still pending
-	pullNeeded        int             // Number of block pulls still pending
-	updated           time.Time       // Time when any of the counters above were last updated
-	closed            bool            // True if the file has been finalClosed.
-	available         []int           // Indexes of the blocks that are available in the temporary file
-	availableUpdated  time.Time       // Time when list of available blocks was last updated
-	mut               sync.RWMutex    // Protects the above
+	err              error           // The first error we hit
+	writer           *lockedWriterAt // Wraps fd to prevent fd closing at the same time as writing
+	copyTotal        int             // Total number of copy actions for the whole job
+	pullTotal        int             // Total number of pull actions for the whole job
+	copyOrigin       int             // Number of blocks copied from the original file
+	copyNeeded       int             // Number of copy actions still pending
+	pullNeeded       int             // Number of block pulls still pending
+	updated          time.Time       // Time when any of the counters above were last updated
+	closed           bool            // True if the file has been finalClosed.
+	available        []int           // Indexes of the blocks that are available in the temporary file
+	availableUpdated time.Time       // Time when list of available blocks was last updated
+	mut              sync.RWMutex    // Protects the above
 }
 
 func newSharedPullerState(file protocol.FileInfo, fs fs.Filesystem, folderID, tempName string, blocks []protocol.BlockInfo, reused []int, ignorePerms, hasCurFile bool, curFile protocol.FileInfo, sparse bool, fsync bool) *sharedPullerState {
+	// Map the existing blocks by hash to block index in the current file
+	blocksMap := make(map[string]int, len(curFile.Blocks))
+	for idx, block := range curFile.Blocks {
+		blocksMap[string(block.Hash)] = idx
+	}
+
 	return &sharedPullerState{
 		file:             file,
 		fs:               fs,
@@ -67,7 +76,7 @@ func newSharedPullerState(file protocol.FileInfo, fs fs.Filesystem, folderID, te
 		ignorePerms:      ignorePerms,
 		hasCurFile:       hasCurFile,
 		curFile:          curFile,
-		mut:              sync.NewRWMutex(),
+		curFileBlocks:    blocksMap,
 		sparse:           sparse,
 		fsync:            fsync,
 		created:          time.Now(),
@@ -222,7 +231,7 @@ func (s *sharedPullerState) tempFileInWritableDir(_ string) error {
 	}
 
 	// Same fd will be used by all writers
-	s.writer = &lockedWriterAt{sync.NewRWMutex(), fd}
+	s.writer = &lockedWriterAt{fd: fd}
 	return nil
 }
 
@@ -282,15 +291,6 @@ func (s *sharedPullerState) skippedSparseBlock(bytes int) {
 	metricFolderProcessedBytesTotal.WithLabelValues(s.folder, metricSourceSkipped).Add(float64(bytes))
 }
 
-func (s *sharedPullerState) copiedFromOriginShifted(bytes int) {
-	s.mut.Lock()
-	s.copyOrigin++
-	s.copyOriginShifted++
-	s.updated = time.Now()
-	s.mut.Unlock()
-	metricFolderProcessedBytesTotal.WithLabelValues(s.folder, metricSourceLocalShifted).Add(float64(bytes))
-}
-
 func (s *sharedPullerState) pullStarted() {
 	s.mut.Lock()
 	s.copyTotal--
@@ -332,18 +332,21 @@ func (s *sharedPullerState) finalClose() (bool, error) {
 		return false, nil
 	}
 
-	if len(s.file.Encrypted) > 0 {
-		if err := s.finalizeEncrypted(); err != nil && s.err == nil {
-			// This is our error as we weren't errored before.
-			s.err = err
+	if s.writer == nil && s.err == nil {
+		// If we didn't even create a temp file up to this point, now is the
+		// time to do so. This also truncates the file to the correct size
+		// if we're using sparse file. If we already errored there's nothing
+		// to do about it here.
+		if err := s.addWriterLocked(); err != nil {
+			s.failLocked(err)
 		}
 	}
 
 	if s.writer != nil {
-		if err := s.writer.SyncClose(s.fsync); err != nil && s.err == nil {
-			// This is our error as we weren't errored before.
-			s.err = err
+		if len(s.file.Encrypted) > 0 {
+			s.failLocked(s.finalizeEncrypted())
 		}
+		s.failLocked(s.writer.SyncClose(s.fsync))
 		s.writer = nil
 	}
 
@@ -363,11 +366,6 @@ func (s *sharedPullerState) finalClose() (bool, error) {
 // folder from encrypted data we can extract this FileInfo from the end of
 // the file and regain the original metadata.
 func (s *sharedPullerState) finalizeEncrypted() error {
-	if s.writer == nil {
-		if err := s.addWriterLocked(); err != nil {
-			return err
-		}
-	}
 	trailerSize, err := writeEncryptionTrailer(s.file, s.writer)
 	if err != nil {
 		return err
@@ -386,11 +384,11 @@ func writeEncryptionTrailer(file protocol.FileInfo, writer io.WriterAt) (int64, 
 
 	trailerSize := encryptionTrailerSize(wireFile)
 	bs := make([]byte, trailerSize)
-	n, err := wireFile.MarshalTo(bs)
+	n, err := protoutil.MarshalTo(bs, wireFile.ToWire(false))
 	if err != nil {
 		return 0, err
 	}
-	binary.BigEndian.PutUint32(bs[n:], uint32(n))
+	binary.BigEndian.PutUint32(bs[n:], uint32(n)) //nolint:gosec
 	bs = bs[:n+4]
 
 	if _, err := writer.WriteAt(bs, wireFile.Size); err != nil {
@@ -401,7 +399,7 @@ func writeEncryptionTrailer(file protocol.FileInfo, writer io.WriterAt) (int64, 
 }
 
 func encryptionTrailerSize(file protocol.FileInfo) int64 {
-	return int64(file.ProtoSize()) + 4
+	return int64(proto.Size(file.ToWire(false))) + 4 // XXX: Inefficient
 }
 
 // Progress returns the momentarily progress for the puller

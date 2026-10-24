@@ -8,6 +8,9 @@ package stun
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"time"
 
@@ -38,6 +41,8 @@ const (
 	NATSymmetricUDPFirewall = stun.NATSymmetricUDPFirewall
 )
 
+var errNotPunchable = errors.New("not punchable")
+
 type Subscriber interface {
 	OnNATTypeChanged(natType NATType)
 	OnExternalAddressChanged(address *Host, via string)
@@ -49,17 +54,11 @@ type Service struct {
 	subscriber Subscriber
 	client     *stun.Client
 
-	lastWriter LastWriter
-
 	natType NATType
 	addr    *Host
 }
 
-type LastWriter interface {
-	LastWrite() time.Time
-}
-
-func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn, lastWriter LastWriter) *Service {
+func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn) *Service {
 	// Construct the client to use the stun conn
 	client := stun.NewClientWithConnection(conn)
 	client.SetSoftwareName("") // Explicitly unset this, seems to freak some servers out.
@@ -77,8 +76,6 @@ func New(cfg config.Wrapper, subscriber Subscriber, conn net.PacketConn, lastWri
 		cfg:        cfg,
 		subscriber: subscriber,
 		client:     client,
-
-		lastWriter: lastWriter,
 
 		natType: NATUnknown,
 		addr:    nil,
@@ -110,10 +107,11 @@ func (s *Service) Serve(ctx context.Context) error {
 		l.Debugf("Starting stun for %s", s)
 
 		for _, addr := range s.cfg.Options().StunServers() {
-			// This blocks until we hit an exit condition or there are issues with the STUN server.
-			// This returns a boolean signifying if a different STUN server should be tried (oppose to the whole thing
-			// shutting down and this winding itself down.
-			s.runStunForServer(ctx, addr)
+			// This blocks until we hit an exit condition or there are
+			// issues with the STUN server.
+			if err := s.runStunForServer(ctx, addr); errors.Is(err, errNotPunchable) {
+				break // we will sleep for a while
+			}
 
 			// Have we been asked to stop?
 			select {
@@ -124,15 +122,10 @@ func (s *Service) Serve(ctx context.Context) error {
 
 			// Are we disabled?
 			if s.cfg.Options().IsStunDisabled() {
-				l.Infoln("STUN disabled")
+				slog.InfoContext(ctx, "STUN disabled")
 				s.setNATType(NATUnknown)
 				s.setExternalAddress(nil, "")
 				goto disabled
-			}
-
-			// Unpunchable NAT? Chillout for some time.
-			if !s.isCurrentNATTypePunchable() {
-				break
 			}
 		}
 
@@ -142,7 +135,7 @@ func (s *Service) Serve(ctx context.Context) error {
 	}
 }
 
-func (s *Service) runStunForServer(ctx context.Context, addr string) {
+func (s *Service) runStunForServer(ctx context.Context, addr string) error {
 	l.Debugf("Running stun for %s via %s", s, addr)
 
 	// Resolve the address, so that in case the server advertises two
@@ -153,7 +146,7 @@ func (s *Service) runStunForServer(ctx context.Context, addr string) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		l.Debugf("%s stun addr resolution on %s: %s", s, addr, err)
-		return
+		return err
 	}
 	s.client.SetServerAddr(udpAddr.String())
 
@@ -163,15 +156,18 @@ func (s *Service) runStunForServer(ctx context.Context, addr string) {
 		natType, extAddr, err = s.client.Discover()
 		return err
 	})
-	if err != nil || extAddr == nil {
-		l.Debugf("%s stun discovery on %s: %s", s, addr, err)
-		return
+	if err != nil {
+		l.Debugf("%s stun discovery on %s: %v", s, addr, err)
+		return err
+	} else if extAddr == nil {
+		l.Debugf("%s stun discovery on %s resulted in no address", s, addr)
+		return fmt.Errorf("%s: no address", addr)
 	}
 
 	// The stun server is most likely borked, try another one.
 	if natType == NATError || natType == NATUnknown || natType == NATBlocked {
 		l.Debugf("%s stun discovery on %s resolved to %s", s, addr, natType)
-		return
+		return fmt.Errorf("%s: bad result: %v", addr, natType)
 	}
 
 	s.setNATType(natType)
@@ -181,15 +177,14 @@ func (s *Service) runStunForServer(ctx context.Context, addr string) {
 	// and such, just let the caller check the nat type and work it out themselves.
 	if !s.isCurrentNATTypePunchable() {
 		l.Debugf("%s cannot punch %s, skipping", s, natType)
-		return
+		return errNotPunchable
 	}
 
 	s.setExternalAddress(extAddr, addr)
-
-	s.stunKeepAlive(ctx, addr, extAddr)
+	return s.stunKeepAlive(ctx, addr, extAddr)
 }
 
-func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host) {
+func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host) error {
 	var err error
 	nextSleep := time.Duration(s.cfg.Options().StunKeepaliveStartS) * time.Second
 
@@ -211,23 +206,18 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 			minSleep := time.Duration(s.cfg.Options().StunKeepaliveMinS) * time.Second
 			if nextSleep < minSleep {
 				l.Debugf("%s keepalive aborting, sleep below min: %s < %s", s, nextSleep, minSleep)
-				return
+				return fmt.Errorf("unreasonably low keepalive: %v", minSleep)
 			}
 		}
 
 		// Adjust the keepalives to fire only nextSleep after last write.
-		lastWrite := ourLastWrite
-		if quicLastWrite := s.lastWriter.LastWrite(); quicLastWrite.After(lastWrite) {
-			lastWrite = quicLastWrite
-		}
 		minSleep := time.Duration(s.cfg.Options().StunKeepaliveMinS) * time.Second
 		if nextSleep < minSleep {
 			nextSleep = minSleep
 		}
-	tryLater:
 		sleepFor := nextSleep
 
-		timeUntilNextKeepalive := time.Until(lastWrite.Add(sleepFor))
+		timeUntilNextKeepalive := time.Until(ourLastWrite.Add(sleepFor))
 		if timeUntilNextKeepalive > 0 {
 			sleepFor = timeUntilNextKeepalive
 		}
@@ -238,20 +228,13 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 		case <-time.After(sleepFor):
 		case <-ctx.Done():
 			l.Debugf("%s stopping, aborting stun", s)
-			return
+			return ctx.Err()
 		}
 
 		if s.cfg.Options().IsStunDisabled() {
 			// Disabled, give up
 			l.Debugf("%s disabled, aborting stun ", s)
-			return
-		}
-
-		// Check if any writes happened while we were sleeping, if they did, sleep again
-		lastWrite = s.lastWriter.LastWrite()
-		if gap := time.Since(lastWrite); gap < nextSleep {
-			l.Debugf("%s stun last write gap less than next sleep: %s < %s. Will try later", s, gap, nextSleep)
-			goto tryLater
+			return errors.New("disabled")
 		}
 
 		l.Debugf("%s stun keepalive", s)
@@ -259,7 +242,7 @@ func (s *Service) stunKeepAlive(ctx context.Context, addr string, extAddr *Host)
 		extAddr, err = s.client.Keepalive()
 		if err != nil {
 			l.Debugf("%s stun keepalive on %s: %s (%v)", s, addr, err, extAddr)
-			return
+			return err
 		}
 		ourLastWrite = time.Now()
 	}

@@ -1,26 +1,100 @@
-linters-settings:
-  maligned:
-    suggest-new: true
-
+version: "2"
 linters:
-  enable-all: true
+  default: all
   disable:
-    - goimports
+    - cyclop
     - depguard
-    - lll
-    - gochecknoinits
-    - gochecknoglobals
-    - gofmt
-    - scopelint
-    - gocyclo
+    - err113
+    - exhaustive
+    - exhaustruct
+    - exhaustruct_v5
+    - forbidigo
+    - funcorder
     - funlen
-    - wsl
+    - gochecknoglobals
+    - gochecknoinits
     - gocognit
+    - goconst
+    - gocyclo
+    - godot
     - godox
-
-service:
-  golangci-lint-version: 1.21.x
-  prepare:
-    - rm -f go.sum # 1.12 -> 1.13 issues with QUIC-go
-    - GO111MODULE=on go mod vendor
-    - go run build.go assets
+    - gomoddirectives
+    - inamedparam
+    - interfacebloat
+    - ireturn
+    - lll
+    - maintidx
+    - mnd
+    - musttag
+    - nestif
+    - nlreturn
+    - noinlineerr
+    - nonamedreturns
+    - paralleltest
+    - prealloc
+    - predeclared
+    - protogetter
+    - recvcheck
+    - revive
+    - tagalign
+    - tagliatelle
+    - testpackage
+    - usetesting # go 1.24
+    - varnamelen
+    - whitespace
+    - wrapcheck
+    - wsl
+    - wsl_v5
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - internal/gen
+      - internal/db/olddb
+      - cmd/dev
+      - repos
+      - third_party$
+      - builtin$
+      - examples$
+      - _test\.go$
+    rules:
+      # relax the slog rules for debug lines, for now
+      - linters: [sloglint]
+        source: Debug
+      # contexts are irrelevant for SQLite
+      - linters: [noctx]
+        text: database/sql
+      # Rollback errors can be ignored
+      - linters: [errcheck]
+        source: Rollback
+      # Embedded fields named in selectors may add clarity
+      - linters: [staticcheck]
+        text: QF1008
+      # Don't necessarily rewrite !(foo || bar) to !foo && !bar
+      - linters: [staticcheck]
+        text: QF1001
+      # Don't necessarily pass the context just for the sake of the logger
+      - linters: [contextcheck]
+        text: "->log`"
+  settings:
+    sloglint:
+      context: "scope"
+      static-msg: true
+      msg-style: capitalized
+      key-naming-case: camel
+formatters:
+  enable:
+    - gofumpt
+  exclusions:
+    generated: lax
+    paths:
+      - internal/gen
+      - cmd/dev
+      - repos
+      - third_party$
+      - builtin$
+      - examples$

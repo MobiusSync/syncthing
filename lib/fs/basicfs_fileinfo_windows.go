@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 var execExts map[string]bool
@@ -40,13 +39,13 @@ func (e basicFileInfo) Mode() FileMode {
 	}
 	// Set executable bits on files with executable extensions (.exe, .bat, etc).
 	if isWindowsExecutable(e.Name()) {
-		m |= 0111
+		m |= 0o111
 	}
 	// There is no user/group/others in Windows' read-only attribute, and
 	// all "w" bits are set if the file is not read-only.  Do not send these
 	// group/others-writable bits to other devices in order to avoid
 	// unexpected world-writable files on other platforms.
-	m &^= 0022
+	m &^= 0o022
 	return FileMode(m)
 }
 
@@ -56,10 +55,6 @@ func (e basicFileInfo) Owner() int {
 
 func (e basicFileInfo) Group() int {
 	return -1
-}
-
-func (basicFileInfo) InodeChangeTime() time.Time {
-	return time.Time{}
 }
 
 // osFileInfo converts e to os.FileInfo that is suitable

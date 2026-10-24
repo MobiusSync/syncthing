@@ -12,6 +12,19 @@ body {
     overflow-y: scroll;
 }
 
+/* Keep text readable on the bright semantic backgrounds used by light themes. */
+.alert-success,
+.alert-warning,
+.alert-danger,
+.btn-success,
+.btn-warning {
+    color: #000 !important;
+}
+
+.btn-danger {
+    background-color: #d62c1a;
+}
+
 h1, h2, h3, h4, h5 {
     font-family: "Raleway", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     line-height: 1.25;
@@ -221,8 +234,8 @@ li[language-select] > .dropdown-menu {
 }
 
 li[language-select] > .dropdown-menu > li > a {
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow-wrap: break-word;
 }
 
 .nav>li{
@@ -445,10 +458,23 @@ ul.three-columns li, ul.two-columns li {
         -moz-column-count: 1;
         column-count: 1;
     }
+      /* All buttons, except panel headings, get bottom margin, as they
+       won't fit beside each other anymore. Reduce footer padding to
+       compensate for the margin. */
+    .btn:not(.panel-heading),
+    .btn:not(.panel-heading) + .btn:not(.panel-heading) {
+        margin-bottom: 10px;
+    }
+    
+    .panel-footer {
+        padding-bottom: 0;
+    }
+    .modal-footer {
+        padding-bottom: 5px;
+    }
 }
 
 @media (max-width:479px) {
-
     nav .dropdown-toggle {
         font-size: 1em;
     }
@@ -456,13 +482,7 @@ ul.three-columns li, ul.two-columns li {
     .navbar-nav .open .dropdown-menu > li > a {
         padding: 12px 15px 12px 25px;
     }
-}
 
-.tab-content {
-    padding-top: 10px;
-}
-
-@media (max-width: 430px) {
     /* The selectors are build to target only the content of folder and device
        panels as it would "destroy" e.g. out of sync or recent changes listings.
        The !important is needed to override .visible-xs that sets display to a
@@ -484,20 +504,6 @@ ul.three-columns li, ul.two-columns li {
         width: 100%;
     }
 
-    /* All buttons, except panel headings, get bottom margin, as they
-       won't fit beside each other anymore. Reduce footer padding to
-       compensate for the margin. */
-    .btn:not(.panel-heading),
-    .btn:not(.panel-heading) + .btn:not(.panel-heading) {
-        margin-bottom: 10px;
-    }
-    .panel-footer {
-        padding-bottom: 0;
-    }
-    .modal-footer {
-        padding-bottom: 5px;
-    }
-
     table.table-auto td,
     table.table-auto th,
     table.table-condensed td,
@@ -511,6 +517,10 @@ ul.three-columns li, ul.two-columns li {
     #shareDeviceIdButtons {
         display: inline-block;
     }
+}
+
+.tab-content {
+    padding-top: 10px;
 }
 
 .form-horizontal .form-group {

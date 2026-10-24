@@ -38,37 +38,36 @@ var (
 
 const (
 	// fs operations
-	metricOpChmod             = "chmod"
-	metricOpLchmod            = "lchmod"
-	metricOpChtimes           = "chtimes"
-	metricOpCreate            = "create"
-	metricOpCreateSymlink     = "createsymlink"
-	metricOpDirNames          = "dirnames"
-	metricOpLstat             = "lstat"
-	metricOpMkdir             = "mdkir"
-	metricOpMkdirAll          = "mkdirall"
-	metricOpOpen              = "open"
-	metricOpOpenFile          = "openfile"
-	metricOpReadSymlink       = "readsymlink"
-	metricOpRemove            = "remove"
-	metricOpRemoveAll         = "removeall"
-	metricOpRename            = "rename"
-	metricOpStat              = "stat"
-	metricOpSymlinksSupported = "symlinkssupported"
-	metricOpWalk              = "walk"
-	metricOpWatch             = "watch"
-	metricOpHide              = "hide"
-	metricOpUnhide            = "unhide"
-	metricOpGlob              = "glob"
-	metricOpRoots             = "roots"
-	metricOpUsage             = "usage"
-	metricOpType              = "type"
-	metricOpURI               = "uri"
-	metricOpOptions           = "options"
-	metricOpSameFile          = "samefile"
-	metricOpPlatformData      = "platformdata"
-	metricOpGetXattr          = "getxattr"
-	metricOpSetXattr          = "setxattr"
+	metricOpChmod         = "chmod"
+	metricOpLchmod        = "lchmod"
+	metricOpChtimes       = "chtimes"
+	metricOpCreate        = "create"
+	metricOpCreateSymlink = "createsymlink"
+	metricOpDirNames      = "dirnames"
+	metricOpLstat         = "lstat"
+	metricOpMkdir         = "mdkir"
+	metricOpMkdirAll      = "mkdirall"
+	metricOpOpen          = "open"
+	metricOpOpenFile      = "openfile"
+	metricOpReadSymlink   = "readsymlink"
+	metricOpRemove        = "remove"
+	metricOpRemoveAll     = "removeall"
+	metricOpRename        = "rename"
+	metricOpStat          = "stat"
+	metricOpWalk          = "walk"
+	metricOpWatch         = "watch"
+	metricOpHide          = "hide"
+	metricOpUnhide        = "unhide"
+	metricOpGlob          = "glob"
+	metricOpRoots         = "roots"
+	metricOpUsage         = "usage"
+	metricOpType          = "type"
+	metricOpURI           = "uri"
+	metricOpOptions       = "options"
+	metricOpSameFile      = "samefile"
+	metricOpPlatformData  = "platformdata"
+	metricOpGetXattr      = "getxattr"
+	metricOpSetXattr      = "setxattr"
 
 	// file operations
 	metricOpRead     = "read"
@@ -194,11 +193,6 @@ func (m *metricsFS) Stat(name string) (FileInfo, error) {
 	return m.next.Stat(name)
 }
 
-func (m *metricsFS) SymlinksSupported() bool {
-	defer m.account(metricOpSymlinksSupported)(-1)
-	return m.next.SymlinksSupported()
-}
-
 func (m *metricsFS) Walk(name string, walkFn WalkFunc) error {
 	defer m.account(metricOpWalk)(-1)
 	return m.next.Walk(name, walkFn)
@@ -271,10 +265,6 @@ func (m *metricsFS) SetXattr(path string, xattrs []protocol.Xattr, xattrFilter X
 
 func (m *metricsFS) underlying() (Filesystem, bool) {
 	return m.next, true
-}
-
-func (m *metricsFS) wrapperType() filesystemWrapperType {
-	return filesystemWrapperTypeMetrics
 }
 
 type metricsFile struct {

@@ -13,12 +13,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
 )
 
 func init() {
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		u := fmt.Sprintf("permanent%d", i)
 		permanentRelays = append(permanentRelays, &relay{URL: u})
 	}
@@ -28,8 +27,6 @@ func init() {
 		{URL: "known2"},
 		{URL: "known3"},
 	}
-
-	mut = new(sync.RWMutex)
 }
 
 // Regression test: handleGetRequest should not modify permanentRelays.

@@ -5,12 +5,30 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build windows
-// +build windows
 
-package toplevel
+package main
 
-import "os/exec"
+import "golang.org/x/sys/windows"
 
 func openURL(url string) error {
-	return exec.Command("cmd.exe", "/C", "start "+url).Run()
+	urlPtr, err := windows.UTF16PtrFromString(url)
+	if err != nil {
+		return err
+	}
+
+	verbPtr, err := windows.UTF16PtrFromString("open")
+	if err != nil {
+		return err
+	}
+
+	err = windows.ShellExecute(
+		0,       // hwnd
+		verbPtr, // operation
+		urlPtr,  // file
+		nil,     // parameters
+		nil,     // directory
+		windows.SW_SHOWNORMAL,
+	)
+
+	return err
 }

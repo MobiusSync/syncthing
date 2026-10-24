@@ -7,17 +7,18 @@
 package discover
 
 import (
-	stdsync "sync"
+	"maps"
+	"sync"
 	"time"
 
-	"github.com/thejerf/suture/v4"
-
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/thejerf/suture/v4"
 )
 
 // A cachedFinder is a Finder with associated cache timeouts.
 type cachedFinder struct {
 	Finder
+
 	cacheTime    time.Duration
 	negCacheTime time.Duration
 	cache        *cache
@@ -35,7 +36,7 @@ type cachedError interface {
 
 type cache struct {
 	entries map[protocol.DeviceID]CacheEntry
-	mut     stdsync.Mutex
+	mut     sync.Mutex
 }
 
 func newCache() *cache {
@@ -60,9 +61,7 @@ func (c *cache) Get(id protocol.DeviceID) (CacheEntry, bool) {
 func (c *cache) Cache() map[protocol.DeviceID]CacheEntry {
 	c.mut.Lock()
 	m := make(map[protocol.DeviceID]CacheEntry, len(c.entries))
-	for k, v := range c.entries {
-		m[k] = v
-	}
+	maps.Copy(m, c.entries)
 	c.mut.Unlock()
 	return m
 }

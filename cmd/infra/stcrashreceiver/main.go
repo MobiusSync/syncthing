@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,9 +29,8 @@ import (
 	"github.com/alecthomas/kong"
 	raven "github.com/getsentry/raven-go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/build"
-	"github.com/syncthing/syncthing/lib/ur"
+	"github.com/syncthing/syncthing/lib/ur/contract"
 )
 
 const maxRequestSize = 1 << 20 // 1 MiB
@@ -44,7 +44,7 @@ type cli struct {
 	SentryQueue    int    `help:"Maximum number of reports to queue for sending to Sentry" default:"64" env:"SENTRY_QUEUE"`
 	DiskQueue      int    `help:"Maximum number of reports to queue for writing to disk" default:"64" env:"DISK_QUEUE"`
 	MetricsListen  string `help:"HTTP listen address for metrics" default:":8081" env:"METRICS_LISTEN_ADDRESS"`
-	IngorePatterns string `help:"File containing ignore patterns (regexp)" env:"IGNORE_PATTERNS" type:"existingfile"`
+	IgnorePatterns string `help:"File containing ignore patterns (regexp)" env:"IGNORE_PATTERNS" type:"existingfile"`
 }
 
 func main() {
@@ -68,9 +68,9 @@ func main() {
 	go ss.Serve(context.Background())
 
 	var ip *ignorePatterns
-	if params.IngorePatterns != "" {
+	if params.IgnorePatterns != "" {
 		var err error
-		ip, err = loadIgnorePatterns(params.IngorePatterns)
+		ip, err = loadIgnorePatterns(params.IgnorePatterns)
 		if err != nil {
 			log.Fatalf("Failed to load ignore patterns: %v", err)
 		}
@@ -90,6 +90,7 @@ func main() {
 	if params.MetricsListen != "" {
 		mmux := http.NewServeMux()
 		mmux.Handle("/metrics", promhttp.Handler())
+		mmux.HandleFunc("/debug/pprof/", pprof.Index)
 		go func() {
 			if err := http.ListenAndServe(params.MetricsListen, mmux); err != nil {
 				log.Fatalln("HTTP serve metrics:", err)
@@ -102,6 +103,8 @@ func main() {
 	}
 
 	log.SetOutput(os.Stdout)
+	log.Println(build.LongVersionFor("stcrashreceiver"))
+
 	if err := http.ListenAndServe(params.Listen, mux); err != nil {
 		log.Fatalln("HTTP serve:", err)
 	}
@@ -118,19 +121,20 @@ func handleFailureFn(dsn, failureDir string, ignore *ignorePatterns) func(w http
 		bs, err := io.ReadAll(lr)
 		req.Body.Close()
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if ignore.match(bs) {
+		if pat, ok := ignore.match(bs); ok {
+			metricIgnoreMatchesTotal.WithLabelValues(pat).Inc()
 			result = "ignored"
 			return
 		}
 
-		var reports []ur.FailureReport
+		var reports []contract.FailureReport
 		err = json.Unmarshal(bs, &reports)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if len(reports) == 0 {
@@ -141,7 +145,7 @@ func handleFailureFn(dsn, failureDir string, ignore *ignorePatterns) func(w http
 
 		version, err := build.ParseVersion(reports[0].Version)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		for _, r := range reports {
@@ -175,7 +179,7 @@ func handleFailureFn(dsn, failureDir string, ignore *ignorePatterns) func(w http
 	}
 }
 
-func saveFailureWithGoroutines(data ur.FailureData, failureDir string) (string, error) {
+func saveFailureWithGoroutines(data contract.FailureData, failureDir string) (string, error) {
 	bs := make([]byte, len(data.Description)+len(data.Goroutines))
 	copy(bs, data.Description)
 	copy(bs[len(data.Description):], data.Goroutines)
@@ -199,7 +203,7 @@ func loadIgnorePatterns(path string) (*ignorePatterns, error) {
 	}
 
 	var patterns []*regexp.Regexp
-	for _, line := range strings.Split(string(bs), "\n") {
+	for line := range strings.SplitSeq(string(bs), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -215,14 +219,14 @@ func loadIgnorePatterns(path string) (*ignorePatterns, error) {
 	return &ignorePatterns{patterns: patterns}, nil
 }
 
-func (i *ignorePatterns) match(report []byte) bool {
+func (i *ignorePatterns) match(report []byte) (string, bool) {
 	if i == nil {
-		return false
+		return "", false
 	}
 	for _, re := range i.patterns {
 		if re.Match(report) {
-			return true
+			return re.String(), true
 		}
 	}
-	return false
+	return "", false
 }

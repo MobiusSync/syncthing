@@ -2,12 +2,46 @@
   <div class="modal-body">
     <form role="form" name="folderEditor">
       <ul class="nav nav-tabs" ng-init="loadFormIntoScope(folderEditor)">
-        <li ng-class="{'disabled': currentFolder._editing == 'new-ignores'}" class="active"><a data-toggle="tab" href="{{currentFolder._editing == 'new-ignores' ? '' : '#folder-general'}}"><span class="fas fa-cog"></span> <span translate>General</span></a></li>
-        <li ng-class="{'disabled': currentFolder._editing == 'new-ignores'}"><a data-toggle="tab" href="{{currentFolder._editing == 'new-ignores' ? '' : '#folder-sharing'}}"><span class="fas fa-share-alt"></span> <span translate>Sharing</span></a></li>
-        <!-- %IOS_PHOTO_FOLDER_SETTINGS_TAB% -->
-        <li ng-class="{'disabled': currentFolder._editing == 'new-ignores'}"><a data-toggle="tab" href="{{currentFolder._editing == 'new-ignores' ? '' : '#folder-versioning'}}"><span class="fa fa-files-o"></span> <span translate>File Versioning</span></a></li>
-        <li ng-class="{'disabled': currentFolder._recvEnc}"><a data-toggle="tab" href="{{currentFolder._recvEnc ? '' : '#folder-ignores'}}"><span class="fas fa-filter"></span> <span translate>Ignore Patterns</span></a></li>
-        <li ng-class="{'disabled': currentFolder._editing == 'new-ignores'}"><a data-toggle="tab" href="{{currentFolder._editing == 'new-ignores' ? '' : '#folder-advanced'}}"><span class="fas fa-cogs"></span> <span translate>Advanced</span></a></li>
+        <li ng-class="{disabled: isFolderTabDisabled('general')}">
+          <a
+            ng-attr-data-toggle="{{isFolderTabDisabled('general') ? undefined : 'tab'}}"
+            ng-attr-href="{{isFolderTabDisabled('general') ? undefined : '#folder-general'}}"
+            ng-click="onFolderTabClick($event, 'general')">
+            <span class="fas fa-cog"></span> <span translate>General</span>
+          </a>
+        </li>
+        <li ng-class="{disabled: isFolderTabDisabled('sharing')}">
+          <a
+            ng-attr-data-toggle="{{isFolderTabDisabled('sharing') ? undefined : 'tab'}}"
+            ng-attr-href="{{isFolderTabDisabled('sharing') ? undefined : '#folder-sharing'}}"
+            ng-click="onFolderTabClick($event, 'sharing')">
+            <span class="fas fa-share-alt"></span> <span translate>Sharing</span>
+          </a>
+        </li>
+        <li ng-class="{disabled: isFolderTabDisabled('versioning')}">
+          <a
+            ng-attr-data-toggle="{{isFolderTabDisabled('versioning') ? undefined : 'tab'}}"
+            ng-attr-href="{{isFolderTabDisabled('versioning') ? undefined : '#folder-versioning'}}"
+            ng-click="onFolderTabClick($event, 'versioning')">
+            <span class="fa fa-files-o"></span> <span translate>File Versioning</span>
+          </a>
+        </li>
+        <li ng-class="{disabled: isFolderTabDisabled('ignores')}">
+          <a
+            ng-attr-data-toggle="{{isFolderTabDisabled('ignores') ? undefined : 'tab'}}"
+            ng-attr-href="{{isFolderTabDisabled('ignores') ? undefined : '#folder-ignores'}}"
+            ng-click="onFolderTabClick($event, 'ignores')">
+            <span class="fas fa-filter"></span> <span translate>Ignore Patterns</span>
+          </a>
+        </li>
+        <li ng-class="{disabled: isFolderTabDisabled('advanced')}">
+          <a
+            ng-attr-data-toggle="{{isFolderTabDisabled('advanced') ? undefined : 'tab'}}"
+            ng-attr-href="{{isFolderTabDisabled('advanced') ? undefined : '#folder-advanced'}}"
+            ng-click="onFolderTabClick($event, 'advanced')">
+            <span class="fas fa-cogs"></span> <span translate>Advanced</span>
+          </a>
+        </li>
       </ul>
       <div class="tab-content">
 
@@ -17,6 +51,16 @@
             <input name="folderLabel" id="folderLabel" class="form-control" type="text" ng-model="currentFolder.label" value="{{currentFolder.label}}" />
             <p class="help-block">
               <span translate ng-if="folderEditor.folderLabel.$valid || folderEditor.folderLabel.$pristine">Optional descriptive label for the folder. Can be different on each device.</span>
+            </p>
+          </div>
+          <div class="form-group" ng-class="{'has-error': folderEditor.folderGroup.$invalid && folderEditor.folderGroup.$dirty && !editingFolderDefaults()}">
+            <label for="folderGroup"><span translate>Folder Group</span></label>
+            <input name="folderGroup" id="folderGroup" class="form-control" type="text" ng-model="currentFolder.group" value="{{currentFolder.group}}" list="folder-group-list"/>
+            <datalist id="folder-group-list">
+              <option ng-repeat="(group, folders) in foldersGrouped" value="{{group}}" />
+            </datalist>
+            <p class="help-block">
+              <span translate ng-if="folderEditor.folderGroup.$valid || folderEditor.folderGroup.$pristine">Optional group for the folder. Can be different on each device.</span>
             </p>
           </div>
           <div ng-if="!editingFolderDefaults()" class="form-group" ng-class="{'has-error': folderEditor.folderID.$invalid && folderEditor.folderID.$dirty}">
@@ -35,8 +79,8 @@
             <datalist id="directory-list">
               <option ng-repeat="directory in directoryList" value="{{ directory }}" />
             </datalist>
-            <!-- %PICK_IOS_FOLDER% -->
             <p class="help-block">
+              <span ng-if="folderEditor.folderPath.$valid || folderEditor.folderPath.$pristine"><span translate>Path to the folder on the local computer. Will be created if it does not exist. The tilde character (~) can be used as a shortcut for</span> <code>{{system.tilde}}</code>.</br></span>
               <span translate ng-if="folderEditor.folderPath.$error.required && folderEditor.folderPath.$dirty && !editingFolderDefaults()">The folder path cannot be blank.</span>
               <span class="text-danger" translate translate-value-other-folder="{{folderPathErrors.otherID}}" ng-if="folderPathErrors.isSub && folderPathErrors.otherLabel.length == 0">Warning, this path is a subdirectory of an existing folder "{%otherFolder%}".</span>
               <span class="text-danger" translate translate-value-other-folder="{{folderPathErrors.otherID}}" translate-value-other-folder-label="{{folderPathErrors.otherLabel}}" ng-if="folderPathErrors.isSub && folderPathErrors.otherLabel.length != 0">Warning, this path is a subdirectory of an existing folder "{%otherFolderLabel%}" ({%otherFolder%}).</span>
@@ -82,8 +126,6 @@
           </div>
         </div>
 
-        <!-- %IOS_PHOTO_FOLDER_SETTINGS_PANE% -->
-
         <div id="folder-versioning" class="tab-pane">
           <div class="form-group">
             <label translate>File Versioning</label>&emsp;<a href="{{docsURL('users/versioning')}}" target="_blank"><span class="fas fa-question-circle"></span>&nbsp;<span translate>Help</span></a>
@@ -92,6 +134,7 @@
               <option value="trashcan" translate>Trash Can File Versioning</option>
               <option value="simple" translate>Simple File Versioning</option>
               <option value="staggered" translate>Staggered File Versioning</option>
+              <option value="external" translate>External File Versioning</option>
             </select>
           </div>
           <div class="form-group" ng-if="currentFolder._guiVersioning.selector=='trashcan' || currentFolder._guiVersioning.selector=='simple'" ng-class="{'has-error': folderEditor.trashcanClean.$invalid && folderEditor.trashcanClean.$dirty}">
@@ -148,7 +191,7 @@
           <div class="form-group" ng-if="internalVersioningEnabled()" ng-class="{'has-error': folderEditor.cleanupIntervalS.$invalid && folderEditor.cleanupIntervalS.$dirty}">
             <label translate for="cleanupIntervalS">Cleanup Interval</label>
             <div class="input-group">
-              <input name="cleanupIntervalS" id="cleanupIntervalS" class="form-control text-right" type="number" ng-model="currentFolder._guiVersioning.cleanupIntervalS" required="" min="0" max="31536000" aria-required="true" />
+              <input name="cleanupIntervalS" id="cleanupIntervalS" class="form-control text-right" type="number" ng-model="currentFolder._guiVersioning.cleanupIntervalS" required="" min="0" max="31536000" step="3600" aria-required="true" />
               <div class="input-group-addon" translate>seconds</div>
             </div>
             <p class="help-block">
@@ -205,6 +248,15 @@
 
               <div class="row">
                 <div class="col-md-6">
+                  <label>
+                    <input type="checkbox" ng-model="currentFolder.fsWatcherEnabled" ng-change="setFSWatcherIntervalDefault()">&nbsp;<span translate>Watch for Changes</span>
+                  </label>
+                  <p class="help-block">
+                    <span translate>Use notifications from the filesystem to detect changed items.</span>
+                    <span translate>Watching for changes discovers most changes without periodic scanning.</span>
+                  </p>
+                </div>
+                <div class="col-md-6">
                   <label for="rescanIntervalS" translate>Full Rescan Interval (s)</label>
                   <input name="rescanIntervalS" id="rescanIntervalS" class="form-control" type="number" ng-model="currentFolder.rescanIntervalS" required="" aria-required="true" min="0" />
                   <p class="help-block" ng-if="!folderEditor.rescanIntervalS.$valid && folderEditor.rescanIntervalS.$dirty" translate>
@@ -244,6 +296,9 @@
               <select class="form-control" ng-if="currentFolder.type == 'sendonly'" disabled>
                 <option value="disabled" translate>Disabled</option>
               </select>
+              <p class="help-block" ng-if="currentFolder.type === 'sendonly'" translate translate-value-foldertype="{{'Send Only' | translate}}">
+                Cannot be enabled when the folder type is "{%foldertype%}".
+              </p>
             </div>
           </div>
 
@@ -275,6 +330,9 @@
               <p translate class="help-block">
                 Disables comparing and syncing file permissions. Useful on systems with nonexistent or custom permissions (e.g. FAT, exFAT, Synology, Android).
               </p>
+              <p class="help-block" ng-if="currentFolder._recvEnc" translate translate-value-foldertype="{{'Receive Encrypted' | translate}}">
+                Always turned on when the folder type is "{%foldertype%}".
+              </p>
             </div>
           </div>
 
@@ -290,11 +348,17 @@
               <p translate class="help-block">
                 Enables sending ownership information to other devices, and applying incoming ownership information. Typically requires running with elevated privileges.
               </p>
+              <p class="help-block" ng-if="has(['sendonly', 'receiveencrypted'], currentFolder.type)" translate translate-value-foldertype="{{currentFolder.type === 'sendonly' ? ('Send Only' | translate) : currentFolder.type === 'receiveencrypted' ? ('Receive Encrypted' | translate) : ''}}">
+                Cannot be enabled when the folder type is "{%foldertype%}".
+              </p>
               <label>
                 <input type="checkbox" ng-disabled="currentFolder.type == 'receiveonly' || currentFolder.type == 'receiveencrypted' || currentFolder.syncOwnership" ng-checked="currentFolder.sendOwnership || currentFolder.syncOwnership" ng-model="currentFolder.sendOwnership" /> <span translate>Send Ownership</span>
               </label>
               <p translate class="help-block">
                 Enables sending ownership information to other devices, but not applying incoming ownership information. This can have a significant performance impact. Always enabled when "Sync Ownership" is enabled.
+              </p>
+              <p class="help-block" ng-if="has(['receiveonly', 'receiveencrypted'], currentFolder.type)" translate translate-value-foldertype="{{currentFolder.type === 'receiveonly' ? ('Receive Only' | translate) : currentFolder.type === 'receiveencrypted' ? ('Receive Encrypted' | translate) : ''}}">
+                Cannot be enabled when the folder type is "{%foldertype%}".
               </p>
             </div>
             <div class="col-md-6 form-group">
@@ -308,11 +372,28 @@
               <p translate class="help-block">
                 Enables sending extended attributes to other devices, and applying incoming extended attributes. May require running with elevated privileges.
               </p>
+              <p class="help-block" ng-if="has(['sendonly', 'receiveencrypted'], currentFolder.type)" translate translate-value-foldertype="{{currentFolder.type === 'sendonly' ? ('Send Only' | translate) : currentFolder.type === 'receiveencrypted' ? ('Receive Encrypted' | translate) : ''}}">
+                Cannot be enabled when the folder type is "{%foldertype%}".
+              </p>
               <label>
                 <input type="checkbox" ng-disabled="currentFolder.type == 'receiveonly' || currentFolder.type == 'receiveencrypted' || currentFolder.syncXattrs" ng-checked="currentFolder.sendXattrs || currentFolder.syncXattrs" ng-model="currentFolder.sendXattrs" /> <span translate>Send Extended Attributes</span>
               </label>
               <p translate class="help-block">
                 Enables sending extended attributes to other devices, but not applying incoming extended attributes. This can have a significant performance impact. Always enabled when "Sync Extended Attributes" is enabled.
+              </p>
+              <p class="help-block" ng-if="has(['receiveonly', 'receiveencrypted'], currentFolder.type)" translate translate-value-foldertype="{{currentFolder.type === 'receiveonly' ? ('Receive Only' | translate) : currentFolder.type === 'receiveencrypted' ? ('Receive Encrypted' | translate) : ''}}">
+                Cannot be enabled when the folder type is "{%foldertype%}".
+              </p>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-6 form-group">
+              <label>
+                <input type="checkbox" ng-model="currentFolder.blockIndexing" /> <span translate>Block Indexing</span>
+              </label>
+              <p translate class="help-block">
+                Maintain an index of all blocks in the folder, enabling reuse of blocks from other files when syncing changes. Disable to reduce database size at the cost of not being able to reuse blocks across files.
               </p>
             </div>
           </div>

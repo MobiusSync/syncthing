@@ -12,12 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/api/auto"
 	"github.com/syncthing/syncthing/lib/assets"
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 const themePrefix = "theme-assets/"
@@ -36,7 +36,6 @@ func newStaticsServer(theme, assetDir string) *staticsServer {
 	s := &staticsServer{
 		assetDir:        assetDir,
 		assets:          auto.Assets(),
-		mut:             sync.NewRWMutex(),
 		theme:           theme,
 		lastThemeChange: time.Now().UTC(),
 	}
@@ -75,11 +74,7 @@ func (s *staticsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *staticsServer) serveAsset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 
-	file := r.URL.Path
-
-	if file[0] == '/' {
-		file = file[1:]
-	}
+	file := strings.TrimPrefix(r.URL.Path, "/")
 
 	if file == "" {
 		file = "index.html"

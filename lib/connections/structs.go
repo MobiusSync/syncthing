@@ -11,9 +11,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"time"
+
+	"github.com/thejerf/suture/v4"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections/registry"
@@ -21,8 +24,6 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/stats"
-
-	"github.com/thejerf/suture/v4"
 )
 
 type tlsConn interface {
@@ -38,6 +39,7 @@ type tlsConn interface {
 // came from (type, priority).
 type internalConn struct {
 	tlsConn
+
 	connType      connType
 	isLocal       bool
 	priority      int
@@ -150,6 +152,10 @@ func (c internalConn) String() string {
 		t = "LAN"
 	}
 	return fmt.Sprintf("%s-%s/%s/%s/%s-P%d-%s", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto(), t, c.Priority(), c.connectionID)
+}
+
+func (c internalConn) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("local", c.LocalAddr().String()), slog.String("remote", c.RemoteAddr().String()), slog.String("type", c.Type()), slog.Bool("lan", c.isLocal), slog.String("crypto", c.Crypto()), slog.Int("prio", c.priority), slog.String("id", c.ConnectionID()))
 }
 
 type dialerFactory interface {

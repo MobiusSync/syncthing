@@ -5,14 +5,13 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build freebsd || netbsd
-// +build freebsd netbsd
 
 package fs
 
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -69,7 +68,7 @@ func listXattr(path string) ([]string, error) {
 		}
 	}
 
-	sort.Strings(attrs)
+	slices.Sort(attrs)
 	return attrs, nil
 }
 

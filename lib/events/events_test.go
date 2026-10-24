@@ -81,7 +81,6 @@ func TestEventAfterSubscribe(t *testing.T) {
 	l.Log(DeviceConnected, "foo")
 
 	ev, err := s.Poll(timeout)
-
 	if err != nil {
 		t.Fatal("Unexpected error:", err)
 	}
@@ -128,7 +127,7 @@ func TestBufferOverflow(t *testing.T) {
 
 	t0 := time.Now()
 	const nEvents = BufferSize * 2
-	for i := 0; i < nEvents; i++ {
+	for range nEvents {
 		l.Log(DeviceConnected, "foo")
 	}
 	if d := time.Since(t0); d > 15*time.Second {
@@ -238,7 +237,7 @@ func TestBufferedSub(t *testing.T) {
 	bs := NewBufferedSubscription(s, 10*BufferSize)
 
 	go func() {
-		for i := 0; i < 10*BufferSize; i++ {
+		for i := range 10 * BufferSize {
 			l.Log(DeviceConnected, fmt.Sprintf("event-%d", i))
 			if i%30 == 0 {
 				// Give the buffer routine time to pick up the events
@@ -379,11 +378,8 @@ func TestUnsubscribeContention(t *testing.T) {
 
 	stopListeners := make(chan struct{})
 	var listenerWg sync.WaitGroup
-	listenerWg.Add(listeners)
-	for i := 0; i < listeners; i++ {
-		go func() {
-			defer listenerWg.Done()
-
+	for range listeners {
+		listenerWg.Go(func() {
 			s := l.Subscribe(AllEvents)
 			defer s.Unsubscribe()
 
@@ -395,7 +391,7 @@ func TestUnsubscribeContention(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	// Start senders. These send pointless events until the stop channel is
@@ -404,11 +400,8 @@ func TestUnsubscribeContention(t *testing.T) {
 	stopSenders := make(chan struct{})
 	defer close(stopSenders)
 	var senderWg sync.WaitGroup
-	senderWg.Add(senders)
-	for i := 0; i < senders; i++ {
-		go func() {
-			defer senderWg.Done()
-
+	for range senders {
+		senderWg.Go(func() {
 			t := time.NewTicker(time.Millisecond)
 
 			for {
@@ -420,7 +413,7 @@ func TestUnsubscribeContention(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	// Give everything time to start up.

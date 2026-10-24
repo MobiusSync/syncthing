@@ -17,8 +17,6 @@ import (
 	"path/filepath"
 
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db/backend"
-	"github.com/syncthing/syncthing/lib/locations"
 )
 
 func responseToBArray(response *http.Response) ([]byte, error) {
@@ -114,7 +112,7 @@ func getConfig(c APIClient) (config.Configuration, error) {
 	return cfg, nil
 }
 
-func prettyPrintJSON(data interface{}) error {
+func prettyPrintJSON(data any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(data)
@@ -125,25 +123,12 @@ func prettyPrintResponse(response *http.Response) error {
 	if err != nil {
 		return err
 	}
-	var data interface{}
+	var data any
 	if err := json.Unmarshal(bytes, &data); err != nil {
 		return err
 	}
 	// TODO: Check flag for pretty print format
 	return prettyPrintJSON(data)
-}
-
-func getDB() (backend.Backend, error) {
-	return backend.OpenLevelDBRO(locations.Get(locations.Database))
-}
-
-func nulString(bs []byte) string {
-	for i := range bs {
-		if bs[i] == 0 {
-			return string(bs[:i])
-		}
-	}
-	return string(bs)
 }
 
 func normalizePath(path string) string {

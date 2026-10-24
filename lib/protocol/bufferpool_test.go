@@ -1,4 +1,8 @@
-// Copyright (C) 2019 The Protocol Authors.
+// Copyright (C) 2019 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
 
@@ -77,10 +81,8 @@ func TestStressBufferPool(t *testing.T) {
 
 	var wg sync.WaitGroup
 	fail := make(chan struct{}, routines)
-	for i := 0; i < routines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range routines {
+		wg.Go(func() {
 			for time.Since(t0) < runtime {
 				blocks := make([][]byte, 10)
 				for i := range blocks {
@@ -98,7 +100,7 @@ func TestStressBufferPool(t *testing.T) {
 					bp.Put(blocks[i])
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

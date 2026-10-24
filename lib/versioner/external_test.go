@@ -76,15 +76,62 @@ func TestExternal(t *testing.T) {
 	}
 }
 
+func TestExternalCommandSplit(t *testing.T) {
+	e := external{
+		filesystem: fs.NewFilesystem(fs.FilesystemTypeFake, "TestExternalCommandSplit"),
+	}
+
+	cases := []struct {
+		cmd  string
+		safe bool
+	}{
+		{`echo %FOLDER_PATH% %FILE_PATH%`, true},
+		{`echo "%FOLDER_PATH% %FILE_PATH%"`, false},
+		{`echo %FOLDER_PATH%/%FILE_PATH%`, true},
+		{`echo "%FOLDER_PATH%/%FILE_PATH%"`, true},
+		{`echo '%FOLDER_PATH%/%FILE_PATH%'`, true},
+		{`echo "'%FOLDER_PATH%/%FILE_PATH%'"`, false},
+		{`sh -c "echo '%FOLDER_PATH%/%FILE_PATH%'"`, false},
+		{`sh -c "echo %FOLDER_PATH%/%FILE_PATH%"`, false},
+	}
+
+	for _, tc := range cases {
+		e.command = tc.cmd
+		res, err := e.prepareCommand("evil file name")
+		if tc.safe && err != nil {
+			t.Fatal(err)
+		}
+		if !tc.safe && err == nil {
+			t.Logf("%q", res.Path)
+			t.Logf("%q", res.Args)
+			t.Errorf("should be unsafe: %q", tc.cmd)
+		}
+	}
+}
+
+func TestExternalWhitespaceCommand(t *testing.T) {
+	// A whitespace-only command splits into zero words; prepareCommand must
+	// return an error rather than panicking on words[0].
+	e := external{
+		filesystem: fs.NewFilesystem(fs.FilesystemTypeFake, "TestExternalWhitespaceCommand"),
+	}
+	for _, cmd := range []string{" ", "\t", "\n", "  \t \n"} {
+		e.command = cmd
+		if _, err := e.prepareCommand("file"); err == nil {
+			t.Errorf("expected error for command %q, got nil", cmd)
+		}
+	}
+}
+
 func prepForRemoval(t *testing.T, file string) {
 	if err := os.RemoveAll("testdata"); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(file, []byte("hello\n"), 0644); err != nil {
+	if err := os.WriteFile(file, []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

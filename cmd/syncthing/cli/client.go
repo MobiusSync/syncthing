@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/locations"
@@ -27,11 +28,12 @@ import (
 type APIClient interface {
 	Get(url string) (*http.Response, error)
 	Post(url, body string) (*http.Response, error)
-	PutJSON(url string, o interface{}) (*http.Response, error)
+	PutJSON(url string, o any) (*http.Response, error)
 }
 
 type apiClient struct {
 	http.Client
+
 	cfg    config.GUIConfiguration
 	apikey string
 }
@@ -91,11 +93,11 @@ func loadGUIConfig() (config.GUIConfiguration, error) {
 	guiCfg := cfg.GUI()
 
 	if guiCfg.Address() == "" {
-		return config.GUIConfiguration{}, errors.New("Could not find GUI Address")
+		return config.GUIConfiguration{}, errors.New("could not find GUI Address")
 	}
 
 	if guiCfg.APIKey == "" {
-		return config.GUIConfiguration{}, errors.New("Could not find GUI API key")
+		return config.GUIConfiguration{}, errors.New("could not find GUI API key")
 	}
 
 	return guiCfg, nil
@@ -113,7 +115,8 @@ func (c *apiClient) Endpoint() string {
 }
 
 func (c *apiClient) Do(req *http.Request) (*http.Response, error) {
-	req.Header.Set("X-API-Key", c.apikey)
+	req.Header.Set("X-Api-Key", c.apikey)
+	req.Header.Set("User-Agent", build.UserAgent())
 	resp, err := c.Client.Do(req)
 	if err != nil {
 		return nil, err
@@ -133,7 +136,7 @@ func (c *apiClient) RequestString(url, method, data string) (*http.Response, err
 	return c.Request(url, method, bytes.NewBufferString(data))
 }
 
-func (c *apiClient) RequestJSON(url, method string, o interface{}) (*http.Response, error) {
+func (c *apiClient) RequestJSON(url, method string, o any) (*http.Response, error) {
 	data, err := json.Marshal(o)
 	if err != nil {
 		return nil, err
@@ -149,7 +152,7 @@ func (c *apiClient) Post(url, body string) (*http.Response, error) {
 	return c.RequestString(url, "POST", body)
 }
 
-func (c *apiClient) PutJSON(url string, o interface{}) (*http.Response, error) {
+func (c *apiClient) PutJSON(url string, o any) (*http.Response, error) {
 	return c.RequestJSON(url, "PUT", o)
 }
 

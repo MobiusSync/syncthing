@@ -16,7 +16,6 @@ import (
 	"os"
 	"time"
 
-	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
@@ -61,7 +60,6 @@ func checkServers(deviceID protocol.DeviceID, servers ...string) {
 	t0 := time.Now()
 	resc := make(chan checkResult)
 	for _, srv := range servers {
-		srv := srv
 		go func() {
 			res := checkServer(deviceID, srv)
 			res.server = srv

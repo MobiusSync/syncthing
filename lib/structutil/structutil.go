@@ -93,14 +93,14 @@ func FillNil(data any) {
 func fillNil(data any, skipDeprecated bool) {
 	s := reflect.ValueOf(data).Elem()
 	t := s.Type()
-	for i := 0; i < s.NumField(); i++ {
+	for i := range s.NumField() {
 		if skipDeprecated && strings.HasPrefix(t.Field(i).Name, "Deprecated") {
 			continue
 		}
 
 		f := s.Field(i)
 
-		for f.Kind() == reflect.Ptr && f.IsZero() && f.CanSet() {
+		for f.Kind() == reflect.Pointer && f.IsZero() && f.CanSet() {
 			newValue := reflect.New(f.Type().Elem())
 			f.Set(newValue)
 			f = f.Elem()
@@ -123,7 +123,7 @@ func fillNil(data any, skipDeprecated bool) {
 				if f.Type().Elem().Kind() != reflect.Struct {
 					continue
 				}
-				for i := 0; i < f.Len(); i++ {
+				for i := range f.Len() {
 					fillNil(f.Index(i).Addr().Interface(), skipDeprecated)
 				}
 			case reflect.Struct:
@@ -142,7 +142,7 @@ func FillNilSlices(data any) error {
 	s := reflect.ValueOf(data).Elem()
 	t := s.Type()
 
-	for i := 0; i < s.NumField(); i++ {
+	for i := range s.NumField() {
 		f := s.Field(i)
 		tag := t.Field(i).Tag
 
@@ -157,7 +157,7 @@ func FillNilSlices(data any) error {
 						vs[i] = strings.TrimSpace(vs[i])
 					}
 
-					rv := reflect.MakeSlice(reflect.TypeOf([]string{}), len(vs), len(vs))
+					rv := reflect.MakeSlice(reflect.TypeFor[[]string](), len(vs), len(vs))
 					for i, v := range vs {
 						rv.Index(i).SetString(v)
 					}
