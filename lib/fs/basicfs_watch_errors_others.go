@@ -5,10 +5,9 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //go:build !linux
-// +build !linux
 
 package fs
 
-func reachedMaxUserWatches(err error) bool {
+func reachedMaxUserWatches(_ error) bool {
 	return false
 }

@@ -27,14 +27,14 @@ func TestTrashcanArchiveRestoreSwitcharoo(t *testing.T) {
 	tmpDir2 := t.TempDir()
 
 	cfg := config.FolderConfiguration{
-		FilesystemType: fs.FilesystemTypeBasic,
+		FilesystemType: config.FilesystemTypeBasic,
 		Path:           tmpDir1,
 		Versioning: config.VersioningConfiguration{
-			FSType: fs.FilesystemTypeBasic,
+			FSType: config.FilesystemTypeBasic,
 			FSPath: tmpDir2,
 		},
 	}
-	folderFs := cfg.Filesystem(nil)
+	folderFs := cfg.Filesystem()
 
 	versionsFs := fs.NewFilesystem(fs.FilesystemTypeBasic, tmpDir2)
 
@@ -105,15 +105,15 @@ func TestTrashcanRestoreDeletedFile(t *testing.T) {
 	tmpDir2 := t.TempDir()
 
 	cfg := config.FolderConfiguration{
-		FilesystemType: fs.FilesystemTypeBasic,
+		FilesystemType: config.FilesystemTypeBasic,
 		Path:           tmpDir1,
 		Versioning: config.VersioningConfiguration{
-			FSType: fs.FilesystemTypeBasic,
+			FSType: config.FilesystemTypeBasic,
 			FSPath: tmpDir2,
 		},
 	}
 
-	folderFs := cfg.Filesystem(nil)
+	folderFs := cfg.Filesystem()
 
 	versionsFs := fs.NewFilesystem(fs.FilesystemTypeBasic, tmpDir2)
 
@@ -182,7 +182,7 @@ func readFile(t *testing.T, filesystem fs.Filesystem, name string) string {
 }
 
 func writeFile(t *testing.T, filesystem fs.Filesystem, name, content string) {
-	fd, err := filesystem.OpenFile(name, fs.OptReadWrite|fs.OptCreate, 0777)
+	fd, err := filesystem.OpenFile(name, fs.OptReadWrite|fs.OptCreate, 0o777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestTrashcanCleanOut(t *testing.T) {
 	testDir := t.TempDir()
 
 	cfg := config.FolderConfiguration{
-		FilesystemType: fs.FilesystemTypeBasic,
+		FilesystemType: config.FilesystemTypeBasic,
 		Path:           testDir,
 		Versioning: config.VersioningConfiguration{
 			Params: map[string]string{
@@ -209,11 +209,11 @@ func TestTrashcanCleanOut(t *testing.T) {
 		},
 	}
 
-	fs := cfg.Filesystem(nil)
+	fs := cfg.Filesystem()
 
 	v := newTrashcan(cfg)
 
-	var testcases = map[string]bool{
+	testcases := map[string]bool{
 		".stversions/file1":                     false,
 		".stversions/file2":                     true,
 		".stversions/keep1/file1":               false,
@@ -229,7 +229,7 @@ func TestTrashcanCleanOut(t *testing.T) {
 	t.Run("trashcan versioner trashcan clean up", func(t *testing.T) {
 		oldTime := time.Now().Add(-8 * 24 * time.Hour)
 		for file, shouldRemove := range testcases {
-			fs.MkdirAll(filepath.Dir(file), 0777)
+			fs.MkdirAll(filepath.Dir(file), 0o777)
 
 			writeFile(t, fs, file, "some content")
 

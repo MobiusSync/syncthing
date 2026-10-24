@@ -162,20 +162,31 @@ li.hidden-xs:hover, .navbar-link:hover, .navbar-link:focus {
     background-color: #3498db !important;
 }
 
+.btn-success {
+    color: #fff !important;
+    background-color: #198754 !important;
+}
+
+.btn-success:hover, .btn-success:focus, .btn-success.focus {
+    background-color: #146c43 !important;
+}
+
 .btn-warning {
-    background-color: #c29d0b !important;
+    color: #fff !important;
+    background-color: #806700 !important;
 }
 
 .btn-warning:hover, .btn-warning:focus, .btn-warning.focus {
-    background-color: #f1c40f !important;
+    background-color: #6c5700 !important;
 }
 
 .btn-danger {
+    color: #fff !important;
     background-color: #d62c1a !important;
 }
 
 .btn-danger:hover, .btn-danger:focus, .btn-danger.focus {
-    background-color: #e74c3c !important;
+    background-color: #b62516 !important;
 }
 
 
@@ -192,12 +203,21 @@ li.hidden-xs:hover, .navbar-link:hover, .navbar-link:focus {
     color: #222 !important;
 }
 
+.alert-success,
+.alert-warning,
+.alert-danger {
+    color: #fff !important;
+}
+
+.alert-success {
+    background-color: #198754 !important;
+}
+
 .alert-warning {
-    color: #222 !important;
+    background-color: #806700 !important;
 }
 
 .alert-danger {
-    color: #222 !important;
     background-color: #d62c1a !important;
 }
 
@@ -228,7 +248,6 @@ code.ng-binding{
 }
 
 .well, .form-control[readonly="readonly"], .popover { /* read-only fields*/
-    color: #666 !important;
     border-color: #424242 !important;
     background-color: #3B3B3B !important;
 }
@@ -289,4 +308,18 @@ code.ng-binding{
 /* Remote Devices 'connection type'-icon color set to #aaa */
 .reception {
     filter: invert(77%) sepia(0%) saturate(724%) hue-rotate(146deg) brightness(91%) contrast(85%);
+}
+
+/* Disabled checkbox panels */
+
+.checkbox[disabled] {
+    background-color: #3B3B3B;
+}
+
+.checkbox[disabled] * {
+    color: #999999;
+}
+
+.checkbox[disabled] .help-block {
+    color: #999999 !important;
 }

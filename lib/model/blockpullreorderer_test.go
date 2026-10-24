@@ -8,15 +8,13 @@ package model
 
 import (
 	"reflect"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-var (
-	someBlocks = []protocol.BlockInfo{{Offset: 1}, {Offset: 2}, {Offset: 3}}
-)
+var someBlocks = []protocol.BlockInfo{{Offset: 1}, {Offset: 2}, {Offset: 3}}
 
 func Test_chunk(t *testing.T) {
 	type args struct {
@@ -67,8 +65,8 @@ func Test_inOrderBlockPullReorderer_Reorder(t *testing.T) {
 func Test_standardBlockPullReorderer_Reorder(t *testing.T) {
 	// Order the devices, so we know their ordering ahead of time.
 	devices := []protocol.DeviceID{myID, device1, device2}
-	sort.Slice(devices, func(i, j int) bool {
-		return devices[i].Compare(devices[j]) == -1
+	slices.SortFunc(devices, func(a, b protocol.DeviceID) int {
+		return a.Compare(b)
 	})
 
 	blocks := func(i ...int) []protocol.BlockInfo {
@@ -94,7 +92,7 @@ func Test_standardBlockPullReorderer_Reorder(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := newStandardBlockPullReorderer(tt.myId, tt.devices)
-			p.shuffle = func(i interface{}) {} // Noop shuffle
+			p.shuffle = func(i any) {} // Noop shuffle
 			if got := p.Reorder(tt.blocks); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("reorderBlocksForDevices() = %v, want %v (my idx: %d, count %d)", got, tt.want, p.myIndex, p.count)
 			}

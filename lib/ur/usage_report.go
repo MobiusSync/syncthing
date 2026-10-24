@@ -9,24 +9,27 @@ package ur
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/shirou/gopsutil/v4/process"
+	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections"
-	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/syncthing/syncthing/lib/ur/contract"
 )
@@ -39,7 +42,7 @@ const Version = 3
 var StartTime = time.Now().Truncate(time.Second)
 
 type Model interface {
-	DBSnapshot(folder string) (*db.Snapshot, error)
+	GlobalSize(folder string) (db.Counts, error)
 	UsageReportingStats(report *contract.Report, version int, preview bool)
 }
 
@@ -81,16 +84,14 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 	var totFiles, maxFiles int
 	var totBytes, maxBytes int64
 	for folderID := range s.cfg.Folders() {
-		snap, err := s.model.DBSnapshot(folderID)
+		global, err := s.model.GlobalSize(folderID)
 		if err != nil {
-			continue
+			return nil, err
 		}
-		global := snap.GlobalSize()
-		snap.Release()
-		totFiles += int(global.Files)
+		totFiles += global.Files
 		totBytes += global.Bytes
-		if int(global.Files) > maxFiles {
-			maxFiles = int(global.Files)
+		if global.Files > maxFiles {
+			maxFiles = global.Files
 		}
 		if global.Bytes > maxBytes {
 			maxBytes = global.Bytes
@@ -114,10 +115,16 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 	report.TotMiB = int(totBytes / 1024 / 1024)
 	report.FolderMaxMiB = int(maxBytes / 1024 / 1024)
 	report.MemoryUsageMiB = int((mem.Sys - mem.HeapReleased) / 1024 / 1024)
-	report.SHA256Perf = CpuBench(ctx, 5, 125*time.Millisecond, false)
-	report.HashPerf = CpuBench(ctx, 5, 125*time.Millisecond, true)
+	report.SHA256Perf = CpuBench(ctx, 5, 125*time.Millisecond)
+	report.HashPerf = report.SHA256Perf
 	report.MemorySize = int(memorySize() / 1024 / 1024)
 	report.NumCPU = runtime.NumCPU()
+
+	if proc, err := process.NewProcess(int32(os.Getpid())); err == nil {
+		if mem, err := proc.MemoryInfo(); err == nil {
+			report.ProcessRSSMiB = int(mem.RSS / 1024 / 1024)
+		}
+	}
 
 	for _, cfg := range s.cfg.Folders() {
 		report.RescanIntvs = append(report.RescanIntvs, cfg.RescanIntervalS)
@@ -140,8 +147,6 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			report.FolderUses.AutoNormalize++
 		}
 		switch cfg.Versioning.Type {
-		case "":
-			// None
 		case "simple":
 			report.FolderUses.SimpleVersioning++
 		case "staggered":
@@ -150,11 +155,9 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			report.FolderUses.ExternalVersioning++
 		case "trashcan":
 			report.FolderUses.TrashcanVersioning++
-		default:
-			l.Warnf("Unhandled versioning type for usage reports: %s", cfg.Versioning.Type)
 		}
 	}
-	sort.Ints(report.RescanIntvs)
+	slices.Sort(report.RescanIntvs)
 
 	for _, cfg := range s.cfg.Devices() {
 		if cfg.Introducer {
@@ -164,14 +167,12 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			report.DeviceUses.CustomCertName++
 		}
 		switch cfg.Compression {
-		case protocol.CompressionAlways:
+		case config.CompressionAlways:
 			report.DeviceUses.CompressAlways++
-		case protocol.CompressionMetadata:
+		case config.CompressionMetadata:
 			report.DeviceUses.CompressMetadata++
-		case protocol.CompressionNever:
+		case config.CompressionNever:
 			report.DeviceUses.CompressNever++
-		default:
-			l.Warnf("Unhandled versioning type for usage reports: %s", cfg.Compression)
 		}
 
 		for _, addr := range cfg.Addresses {
@@ -215,7 +216,6 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 		report.Uptime = s.UptimeS()
 		report.NATType = s.connectionsService.NATType()
 		report.AlwaysLocalNets = len(opts.AlwaysLocalNets) > 0
-		report.CacheIgnoredFiles = opts.CacheIgnoredFiles
 		report.OverwriteRemoteDeviceNames = opts.OverwriteRemoteDevNames
 		report.ProgressEmitterEnabled = opts.ProgressUpdateIntervalS > -1
 		report.CustomDefaultFolderPath = defaultFolder.Path != "~"
@@ -240,14 +240,6 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			}
 			if cfg.DisableSparseFiles {
 				report.FolderUsesV3.DisableSparseFiles++
-			}
-			if cfg.DisableTempIndexes {
-				report.FolderUsesV3.DisableTempIndexes++
-			}
-			if cfg.WeakHashThresholdPct < 0 {
-				report.FolderUsesV3.AlwaysWeakHash++
-			} else if cfg.WeakHashThresholdPct != 25 {
-				report.FolderUsesV3.CustomWeakHashThreshold++
 			}
 			if cfg.FSWatcherEnabled {
 				report.FolderUsesV3.FsWatcherEnabled++
@@ -286,8 +278,11 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			if cfg.SyncOwnership {
 				report.FolderUsesV3.SyncOwnership++
 			}
+			if !cfg.BlockIndexing {
+				report.FolderUsesV3.NoBlockIndexing++
+			}
 		}
-		sort.Ints(report.FolderUsesV3.FsWatcherDelays)
+		slices.Sort(report.FolderUsesV3.FsWatcherDelays)
 
 		for _, cfg := range s.cfg.Devices() {
 			if cfg.Untrusted {
@@ -313,9 +308,6 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			}
 			if guiCfg.InsecureAdminAccess {
 				report.GUIStats.InsecureAdminAccess++
-			}
-			if guiCfg.Debugging {
-				report.GUIStats.Debugging++
 			}
 			if guiCfg.InsecureSkipHostCheck {
 				report.GUIStats.InsecureSkipHostCheck++
@@ -364,23 +356,13 @@ func (s *Service) sendUsageReport(ctx context.Context) error {
 		return err
 	}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: dialer.DialContext,
-			Proxy:       http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: s.cfg.Options().URPostInsecurely,
-				MinVersion:         tls.VersionTLS12,
-				ClientSessionCache: tls.NewLRUClientSessionCache(0),
-			},
-		},
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", s.cfg.Options().URURL, &b)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.Options().URURL, &b)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", build.UserAgent())
+	resp, err := tlsutil.ShortLivedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -403,9 +385,9 @@ func (s *Service) Serve(ctx context.Context) error {
 			if s.cfg.Options().URAccepted >= 2 {
 				err := s.sendUsageReport(ctx)
 				if err != nil {
-					l.Infoln("Usage report:", err)
+					slog.WarnContext(ctx, "Failed to send usage report", slogutil.Error(err))
 				} else {
-					l.Infof("Sent usage report (version %d)", s.cfg.Options().URAccepted)
+					slog.InfoContext(ctx, "Sent usage report", "version", s.cfg.Options().URAccepted)
 				}
 			}
 			t.Reset(24 * time.Hour) // next report tomorrow
@@ -435,7 +417,7 @@ var (
 )
 
 // CpuBench returns CPU performance as a measure of single threaded SHA-256 MiB/s
-func CpuBench(ctx context.Context, iterations int, duration time.Duration, useWeakHash bool) float64 {
+func CpuBench(ctx context.Context, iterations int, duration time.Duration) float64 {
 	blocksResultMut.Lock()
 	defer blocksResultMut.Unlock()
 
@@ -445,8 +427,8 @@ func CpuBench(ctx context.Context, iterations int, duration time.Duration, useWe
 	r.Read(bs)
 
 	var perf float64
-	for i := 0; i < iterations; i++ {
-		if v := cpuBenchOnce(ctx, duration, useWeakHash, bs); v > perf {
+	for range iterations {
+		if v := cpuBenchOnce(ctx, duration, bs); v > perf {
 			perf = v
 		}
 	}
@@ -459,13 +441,13 @@ func CpuBench(ctx context.Context, iterations int, duration time.Duration, useWe
 	return perf
 }
 
-func cpuBenchOnce(ctx context.Context, duration time.Duration, useWeakHash bool, bs []byte) float64 {
+func cpuBenchOnce(ctx context.Context, duration time.Duration, bs []byte) float64 {
 	t0 := time.Now()
 	b := 0
 	var err error
 	for time.Since(t0) < duration {
 		r := bytes.NewReader(bs)
-		blocksResult, err = scanner.Blocks(ctx, r, protocol.MinBlockSize, int64(len(bs)), nil, useWeakHash)
+		blocksResult, err = scanner.Blocks(ctx, r, protocol.MinBlockSize, int64(len(bs)), nil)
 		if err != nil {
 			return 0 // Context done
 		}

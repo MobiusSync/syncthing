@@ -5,13 +5,10 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build windows || dragonfly || illumos || solaris || openbsd
-// +build windows dragonfly illumos solaris openbsd
 
 package fs
 
-import (
-	"github.com/syncthing/syncthing/lib/protocol"
-)
+import "github.com/syncthing/syncthing/lib/protocol"
 
 func (f *BasicFilesystem) GetXattr(path string, xattrFilter XattrFilter) ([]protocol.Xattr, error) {
 	return nil, ErrXattrsNotSupported

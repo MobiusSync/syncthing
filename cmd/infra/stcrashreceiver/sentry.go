@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"regexp"
@@ -52,11 +53,15 @@ func (s *sentryService) Serve(ctx context.Context) {
 			pkt, err := parseCrashReport(req.reportID, req.data)
 			if err != nil {
 				log.Println("Failed to parse crash report:", err)
+				metricSentryReportsTotal.WithLabelValues("parse_failure").Inc()
 				continue
 			}
 			if err := sendReport(s.dsn, pkt, req.userID); err != nil {
 				log.Println("Failed to send crash report:", err)
+				metricSentryReportsTotal.WithLabelValues("send_failure").Inc()
+				continue
 			}
+			metricSentryReportsTotal.WithLabelValues("success").Inc()
 
 		case <-ctx.Done():
 			return
@@ -69,6 +74,7 @@ func (s *sentryService) Send(reportID, userID string, data []byte) bool {
 	case s.inbox <- sentryRequest{reportID, userID, data}:
 		return true
 	default:
+		metricCrashReportsTotal.WithLabelValues("overflow").Inc()
 		return false
 	}
 }
@@ -90,7 +96,7 @@ func sendReport(dsn string, pkt *raven.Packet, userID string) error {
 	}
 
 	// The client sets release and such on the packet before sending, in the
-	// misguided idea that it knows this better than than the packet we give
+	// misguided idea that it knows this better than the packet we give
 	// it. So we copy the values from the packet to the client first...
 	cli.SetRelease(pkt.Release)
 	cli.SetEnvironment(pkt.Environment)
@@ -108,11 +114,10 @@ func parseCrashReport(path string, report []byte) (*raven.Packet, error) {
 
 	version, err := build.ParseVersion(string(parts[0]))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w in %q", err, parts[0])
 	}
 	report = parts[1]
 
-	foundPanic := false
 	var subjectLine []byte
 	for {
 		parts = bytes.SplitN(report, []byte("\n"), 2)
@@ -123,20 +128,15 @@ func parseCrashReport(path string, report []byte) (*raven.Packet, error) {
 		line := parts[0]
 		report = parts[1]
 
-		if foundPanic {
-			// The previous line was our "Panic at ..." header. We are now
-			// at the beginning of the real panic trace and this is our
-			// subject line.
+		if bytes.HasPrefix(line, []byte("panic:")) || bytes.HasPrefix(line, []byte("fatal error:")) {
 			subjectLine = line
 			break
-		} else if bytes.HasPrefix(line, []byte("Panic at")) {
-			foundPanic = true
 		}
 	}
 
 	r := bytes.NewReader(report)
 	ctx, _, err := stack.ScanSnapshot(r, io.Discard, stack.DefaultOpts())
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	if ctx == nil || len(ctx.Goroutines) == 0 {

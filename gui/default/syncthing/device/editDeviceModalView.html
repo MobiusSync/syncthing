@@ -15,16 +15,16 @@
               <div ng-if="!editingDeviceNew()" class="well well-sm form-control text-monospace select-on-click" style="height: auto;">{{currentDevice.deviceID}}</div>
               <!-- %QRSCANNER% -->
               <div id="shareDeviceIdButtons" class="input-group-btn">
-                <button data-container="body" type="button" class="btn btn-default" ng-click="copyToClipboard($event, currentDevice.deviceID)" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Copy' | translate }}">
+                <button data-container="body" type="button" class="btn btn-default" ng-click="copyToClipboard($event, currentDevice.deviceID)" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Copy' | translate }}" aria-label="{{ 'Copy' | translate }}">
                   <span class="fa fa-lg fa-clone"></span>
                 </button>
-                <button data-container="body" type="button" class="btn btn-default" ng-click="shareDeviceIdDialog('email')" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Share by Email' | translate }}">
+                <button data-container="body" type="button" class="btn btn-default" ng-click="shareDeviceIdDialog('email')" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Share by Email' | translate }}" aria-label="{{ 'Share by Email' | translate }}">
                   <span class="fa fa-lg fa-envelope-o"></span>
                 </button>
-                <button data-container="body" type="button" class="btn btn-default" ng-click="shareDeviceIdDialog('sms')" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Share by SMS' | translate }}">
+                <button data-container="body" type="button" class="btn btn-default" ng-click="shareDeviceIdDialog('sms')" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Share by SMS' | translate }}" aria-label="{{ 'Share by SMS' | translate }}">
                   <span class="fa fa-lg fa-comments-o"></span>
                 </button>
-                <button data-container="body" type="button" class="btn btn-default" data-toggle="modal" data-target="#idqr" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Show QR' | translate }}">
+                <button data-container="body" type="button" class="btn btn-default" data-toggle="modal" data-target="#idqr" ng-disabled="editingDeviceNew() && !deviceEditor.deviceID.$valid" tooltip data-original-title="{{ 'Show QR' | translate }}" aria-label="{{ 'Show QR' | translate }}">
                   <span class="fa fa-lg fa-qrcode"></span>
                 </button>
               </div>
@@ -57,6 +57,16 @@
             <input id="name" class="form-control" type="text" ng-model="currentDevice.name" />
             <p translate ng-if="currentDevice.deviceID == myID" class="help-block">Shown instead of Device ID in the cluster status. Will be advertised to other devices as an optional default name.</p>
             <p translate ng-if="currentDevice.deviceID != myID" class="help-block">Shown instead of Device ID in the cluster status. Will be updated to the name the device advertises if left empty.</p>
+          </div>
+          <div class="form-group" ng-class="{'has-error': deviceEditor.deviceGroup.$invalid && deviceEditor.deviceGroup.$dirty && !editingDeviceDefaults()}">
+            <label for="deviceGroup"><span translate>Device Group</span></label>
+            <input name="deviceGroup" id="deviceGroup" class="form-control" type="text" ng-model="currentDevice.group" value="{{currentDevice.group}}" list="device-group-list"/>
+            <datalist id="device-group-list">
+              <option ng-repeat="(group, device) in devicesGrouped" value="{{group}}" />
+            </datalist>
+            <p class="help-block">
+              <span translate ng-if="deviceEditor.deviceGroup.$valid || deviceEditor.deviceGroup.$pristine">Optional group for the device. Can be different on each device.</span>
+            </p>
           </div>
         </div>
         <div ng-if="!editingDeviceDefaults()" id="device-sharing" class="tab-pane">
@@ -160,7 +170,7 @@
                   <div class="row">
                     <span class="col-md-8" translate>Incoming Rate Limit (KiB/s)</span>
                     <div class="col-md-4">
-                      <input name="maxRecvKbps" id="maxRecvKbps" class="form-control" type="number" pattern="\d+" ng-model="currentDevice.maxRecvKbps" min="0" />
+                      <input name="maxRecvKbps" id="maxRecvKbps" class="form-control" type="number" pattern="\d+" ng-model="currentDevice.maxRecvKbps" min="0" step="1024" />
                     </div>
                   </div>
                   <p class="help-block" ng-if="!deviceEditor.maxRecvKbps.$valid && deviceEditor.maxRecvKbps.$dirty" translate>The rate limit must be a non-negative number (0: no limit)</p>
@@ -169,7 +179,7 @@
                   <div class="row">
                     <span class="col-md-8" translate>Outgoing Rate Limit (KiB/s)</span>
                     <div class="col-md-4">
-                      <input name="maxSendKbps" id="maxSendKbps" class="form-control" type="number" pattern="\d+" ng-model="currentDevice.maxSendKbps" min="0" />
+                      <input name="maxSendKbps" id="maxSendKbps" class="form-control" type="number" pattern="\d+" ng-model="currentDevice.maxSendKbps" min="0" step="1024" />
                     </div>
                   </div>
                   <p class="help-block" ng-if="!deviceEditor.maxSendKbps.$valid && deviceEditor.maxSendKbps.$dirty" translate>The rate limit must be a non-negative number (0: no limit)</p>

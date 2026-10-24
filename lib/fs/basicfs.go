@@ -9,6 +9,7 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -18,6 +19,8 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/syncthing/syncthing/lib/build"
 )
+
+const FilesystemTypeBasic FilesystemType = "basic"
 
 var (
 	errInvalidFilenameEmpty               = errors.New("name is invalid, must not be empty")
@@ -30,7 +33,7 @@ type OptionJunctionsAsDirs struct{}
 
 func (*OptionJunctionsAsDirs) apply(fs Filesystem) Filesystem {
 	if basic, ok := fs.(*BasicFilesystem); !ok {
-		l.Warnln("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
+		slog.Warn("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
 	} else {
 		basic.junctionsAsDirs = true
 	}
@@ -56,6 +59,12 @@ type (
 	groupCache = valueCache[string, *user.Group]
 )
 
+func init() {
+	RegisterFilesystemType(FilesystemTypeBasic, func(root string, opts ...Option) (Filesystem, error) {
+		return newBasicFilesystem(root, opts...), nil
+	})
+}
+
 func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
 	if root == "" {
 		root = "." // Otherwise "" becomes "/" below
@@ -75,7 +84,7 @@ func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
 		if err2 == nil {
 			root = newroot
 		} else {
-			l.Warnln("Illegal folder", root, "-", err2)
+			slog.Error("Illegal iOS folder", "path", root, "error", err2)
 			// Cannot error from here so use an unwritable path that will fail later
 			root = "~/bad"
 		}
@@ -176,7 +185,7 @@ func (f *BasicFilesystem) MkdirAll(path string, perm FileMode) error {
 		return err
 	}
 
-	return f.mkdirAll(path, os.FileMode(perm))
+	return os.MkdirAll(path, os.FileMode(perm))
 }
 
 func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
@@ -242,22 +251,23 @@ func (f *BasicFilesystem) DirNames(name string) ([]string, error) {
 	return names, nil
 }
 
+// Open opens the file for reading, while not following symlinks
 func (f *BasicFilesystem) Open(name string) (File, error) {
-	rootedName, err := f.rooted(name)
-	if err != nil {
-		return nil, err
-	}
-	fd, err := os.Open(rootedName)
-	if err != nil {
-		return nil, err
-	}
-	return basicFile{fd, name}, err
+	return f.OpenFile(name, os.O_RDONLY, 0)
 }
 
+// OpenFile is the generalised file open call, using the flags to determine
+// the open semantics. We always add O_NOFOLLOW, disallowing opening files
+// by following symlinks, unless OptFollow is set.
 func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File, error) {
 	rootedName, err := f.rooted(name)
 	if err != nil {
 		return nil, err
+	}
+	if flags&OptFollow != 0 {
+		flags &^= OptFollow // unset the synthetic OptFollow bit
+	} else {
+		flags |= optNoFollow
 	}
 	fd, err := os.OpenFile(rootedName, flags, os.FileMode(mode))
 	if err != nil {
@@ -266,16 +276,10 @@ func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File,
 	return basicFile{fd, name}, err
 }
 
+// Create opens a file for writing, creating it as required. The Create will
+// fail if the destination is a symlink.
 func (f *BasicFilesystem) Create(name string) (File, error) {
-	rootedName, err := f.rooted(name)
-	if err != nil {
-		return nil, err
-	}
-	fd, err := os.Create(rootedName)
-	if err != nil {
-		return nil, err
-	}
-	return basicFile{fd, name}, err
+	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 }
 
 func (*BasicFilesystem) Walk(_ string, _ WalkFunc) error {
@@ -339,13 +343,10 @@ func (*BasicFilesystem) underlying() (Filesystem, bool) {
 	return nil, false
 }
 
-func (*BasicFilesystem) wrapperType() filesystemWrapperType {
-	return filesystemWrapperTypeNone
-}
-
 // basicFile implements the fs.File interface on top of an os.File
 type basicFile struct {
 	*os.File
+
 	name string
 }
 
@@ -386,12 +387,12 @@ func longFilenameSupport(path string) string {
 	return path
 }
 
-type ErrWatchEventOutsideRoot struct{ msg string }
+type WatchEventOutsideRootError struct{ msg string }
 
-func (e *ErrWatchEventOutsideRoot) Error() string {
+func (e *WatchEventOutsideRootError) Error() string {
 	return e.msg
 }
 
-func (f *BasicFilesystem) newErrWatchEventOutsideRoot(absPath string, roots []string) *ErrWatchEventOutsideRoot {
-	return &ErrWatchEventOutsideRoot{fmt.Sprintf("Watching for changes encountered an event outside of the filesystem root: f.root==%v, roots==%v, path==%v. This should never happen, please report this message to forum.syncthing.net.", f.root, roots, absPath)}
+func (f *BasicFilesystem) newErrWatchEventOutsideRoot(absPath string, roots []string) *WatchEventOutsideRootError {
+	return &WatchEventOutsideRootError{fmt.Sprintf("Watching for changes encountered an event outside of the filesystem root: f.root==%v, roots==%v, path==%v. This should never happen, please report this message to forum.syncthing.net.", f.root, roots, absPath)}
 }

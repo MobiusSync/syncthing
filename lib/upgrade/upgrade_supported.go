@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build !noupgrade && !ios
-// +build !noupgrade,!ios
 
 package upgrade
 
@@ -14,24 +13,24 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/host"
-	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/signature"
 	"github.com/syncthing/syncthing/lib/tlsutil"
-	"golang.org/x/net/http2"
 )
 
 const DisabledByCompilation = false
@@ -61,55 +60,53 @@ const (
 	maxMetadataSize = 10 << 20 // 10 MiB
 )
 
-var upgradeClient = &http.Client{
-	Timeout: readTimeout,
-	Transport: &http.Transport{
-		DialContext:     dialer.DialContext,
-		Proxy:           http.ProxyFromEnvironment,
-		TLSClientConfig: tlsutil.SecureDefaultWithTLS12(),
-	},
-}
-
 var osVersion string
 
 func init() {
-	_ = http2.ConfigureTransport(upgradeClient.Transport.(*http.Transport))
 	osVersion, _ = host.KernelVersion()
 	osVersion = strings.TrimSpace(osVersion)
 }
 
-func upgradeClientGet(url, version string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func upgradeClientGet(url string) (*http.Response, context.CancelFunc, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 
-	req.Header.Set("User-Agent", fmt.Sprintf(`syncthing %s (%s %s-%s)`, version, runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	req.Header.Set("User-Agent", build.UserAgent())
 	if osVersion != "" {
 		req.Header.Set("Syncthing-Os-Version", osVersion)
 	}
-	return upgradeClient.Do(req)
+	resp, err := tlsutil.ShortLivedHTTPClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
 }
 
 // FetchLatestReleases returns the latest releases. The "current" parameter
 // is used for setting the User-Agent only.
 func FetchLatestReleases(releasesURL, current string) []Release {
-	resp, err := upgradeClientGet(releasesURL, current)
+	resp, cancel, err := upgradeClientGet(releasesURL)
 	if err != nil {
-		l.Infoln("Couldn't fetch release information:", err)
+		slog.Warn("Failed to fetch latest release information", slogutil.Error(err))
 		return nil
 	}
+	defer cancel()
+	defer resp.Body.Close()
 	if resp.StatusCode > 299 {
-		l.Infoln("API call returned HTTP error:", resp.Status)
+		slog.Warn("Failed to fetch latest release information", slogutil.Error(resp.Status))
 		return nil
 	}
 
 	var rels []Release
 	err = json.NewDecoder(io.LimitReader(resp.Body, maxMetadataSize)).Decode(&rels)
 	if err != nil {
-		l.Infoln("Fetching release information:", err)
+		slog.Warn("Failed to decode latest release information", slogutil.Error(err))
 	}
-	resp.Body.Close()
 
 	return rels
 }
@@ -220,13 +217,16 @@ func upgradeToURL(archiveName, binary string, url string) error {
 func readRelease(archiveName, dir, url string) (string, error) {
 	l.Debugf("loading %q", url)
 
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
 
 	req.Header.Add("Accept", "application/octet-stream")
-	resp, err := upgradeClient.Do(req)
+	req.Header.Set("User-Agent", build.UserAgent())
+	resp, err := tlsutil.ShortLivedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -252,15 +252,9 @@ func readTarGz(archiveName, dir string, r io.Reader) (string, error) {
 	var sig []byte
 
 	// Iterate through the files in the archive.
-	i := 0
-	for {
-		if i >= maxArchiveMembers {
-			break
-		}
-		i++
-
+	for range maxArchiveMembers {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			// end of tar archive
 			break
 		}

@@ -38,7 +38,7 @@ func statusService(addr string) {
 
 func getStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	status := make(map[string]interface{})
+	status := make(map[string]any)
 
 	sessionMut.Lock()
 	// This can potentially be double the number of pending sessions, as each session has two keys, one for each side.
@@ -67,7 +67,7 @@ func getStatus(w http.ResponseWriter, _ *http.Request) {
 		rc.rate(30*60/10) * 8 / 1000,
 		rc.rate(60*60/10) * 8 / 1000,
 	}
-	status["options"] = map[string]interface{}{
+	status["options"] = map[string]any{
 		"network-timeout":  networkTimeout / time.Second,
 		"ping-interval":    pingInterval / time.Second,
 		"message-timeout":  messageTimeout / time.Second,
@@ -122,7 +122,7 @@ func (r *rateCalculator) updateRates(interval time.Duration) {
 
 func (r *rateCalculator) rate(periods int) int64 {
 	var tot int64
-	for i := 0; i < periods; i++ {
+	for i := range periods {
 		tot += r.rates[i]
 	}
 	return tot / int64(periods)

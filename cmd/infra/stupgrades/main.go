@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,21 +21,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	_ "github.com/syncthing/syncthing/lib/automaxprocs"
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/httpcache"
 	"github.com/syncthing/syncthing/lib/upgrade"
 )
 
 type cli struct {
-	Listen        string        `default:":8080" help:"Listen address"`
-	MetricsListen string        `default:":8082" help:"Listen address for metrics"`
-	URL           string        `short:"u" default:"https://api.github.com/repos/syncthing/syncthing/releases?per_page=25" help:"GitHub releases url"`
-	Forward       []string      `short:"f" help:"Forwarded pages, format: /path->https://example/com/url"`
-	CacheTime     time.Duration `default:"15m" help:"Cache time"`
+	Listen           string        `default:":8080" help:"Listen address"`
+	MetricsListen    string        `default:":8082" help:"Listen address for metrics"`
+	URL              string        `short:"u" default:"https://api.github.com/repos/syncthing/syncthing/releases?per_page=25" help:"GitHub releases url"`
+	Forward          []string      `short:"f" help:"Forwarded pages, format: /path->https://example/com/url"`
+	CacheTime        time.Duration `default:"15m" help:"Cache time"`
+	AssetURLTemplate string        `help:"Template for asset URLs, blank to use GitHub default" env:"ASSET_URL_TEMPLATE"`
 }
 
 func main() {
@@ -43,6 +47,8 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
+
+	slog.Info(build.LongVersionFor("stupgrades"))
 
 	if err := server(&params); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -58,15 +64,15 @@ func server(params *cli) error {
 		if err != nil {
 			return fmt.Errorf("metrics: %w", err)
 		}
-		slog.Info("Metrics listener started", "addr", params.MetricsListen)
+		slog.Info("Metrics listener started", slogutil.Address(params.MetricsListen))
 		go func() {
 			if err := http.Serve(metricsListen, mux); err != nil {
-				slog.Warn("Metrics server returned", "error", err)
+				slog.Warn("Metrics server returned", slogutil.Error(err))
 			}
 		}()
 	}
 
-	cache := &cachedReleases{url: params.URL}
+	cache := &cachedReleases{url: params.URL, assetURLTemplate: params.AssetURLTemplate}
 	if err := cache.Update(context.Background()); err != nil {
 		return fmt.Errorf("initial cache update: %w", err)
 	} else {
@@ -75,9 +81,9 @@ func server(params *cli) error {
 
 	go func() {
 		for range time.NewTicker(params.CacheTime).C {
-			slog.Info("Refreshing cached releases", "url", params.URL)
+			slog.Info("Refreshing cached releases", slogutil.URI(params.URL))
 			if err := cache.Update(context.Background()); err != nil {
-				slog.Error("Failed to refresh cached releases", "url", params.URL, "error", err)
+				slog.Error("Failed to refresh cached releases", slogutil.URI(params.URL), slogutil.Error(err))
 			}
 		}
 	}()
@@ -109,7 +115,7 @@ func server(params *cli) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	slog.Info("Main listener started", "addr", params.Listen)
+	slog.Info("Main listener started", slogutil.Address(params.Listen))
 
 	return srv.Serve(srvListener)
 }
@@ -137,7 +143,7 @@ func (p *githubReleases) serveReleases(w http.ResponseWriter, req *http.Request)
 	osv := req.Header.Get("Syncthing-Os-Version")
 	if ua != "" && osv != "" {
 		// We should determine the compatibility of the releases.
-		rels = filterForCompabitility(rels, ua, osv)
+		rels = filterForCompatibility(rels, ua, osv)
 	} else {
 		metricFilterCalls.WithLabelValues("no-ua-or-osversion").Inc()
 	}
@@ -185,7 +191,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	if strings.HasPrefix(ct, "application/json") {
 		// Special JSON handling; clean it up a bit.
-		var v interface{}
+		var v any
 		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -201,25 +207,29 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // looking for a prerelease at all.
 func filterForLatest(rels []upgrade.Release) []upgrade.Release {
 	var filtered []upgrade.Release
-	var havePre bool
+	havePre := make(map[string]bool)
+	haveStable := make(map[string]bool)
 	for _, rel := range rels {
-		if !rel.Prerelease {
-			// We found a stable version, we're good now.
+		major, _, _ := strings.Cut(rel.Tag, ".")
+		if !rel.Prerelease && !haveStable[major] {
+			// Remember the first non-pre for each major
 			filtered = append(filtered, rel)
-			break
+			haveStable[major] = true
+			continue
 		}
-		if rel.Prerelease && !havePre {
-			// We remember the first prerelease we find.
+		if rel.Prerelease && !havePre[major] && !haveStable[major] {
+			// We remember the first prerelease we find, unless we've
+			// already found a non-pre of the same major.
 			filtered = append(filtered, rel)
-			havePre = true
+			havePre[major] = true
 		}
 	}
 	return filtered
 }
 
-var userAgentOSArchExp = regexp.MustCompile(`^syncthing.*\(.+ (\w+)-(\w+)\)$`)
+var userAgentOSArchExp = regexp.MustCompile(`^[Ss]yncthing.*\(.+ (\w+)-(\w+)\)$`)
 
-func filterForCompabitility(rels []upgrade.Release, ua, osv string) []upgrade.Release {
+func filterForCompatibility(rels []upgrade.Release, ua, osv string) []upgrade.Release {
 	osArch := userAgentOSArchExp.FindStringSubmatch(ua)
 	if len(osArch) != 3 {
 		metricFilterCalls.WithLabelValues("bad-os-arch").Inc()
@@ -258,9 +268,11 @@ func filterForCompabitility(rels []upgrade.Release, ua, osv string) []upgrade.Re
 }
 
 type cachedReleases struct {
-	url     string
-	mut     sync.RWMutex
-	current []upgrade.Release
+	url                  string
+	assetURLTemplate     string
+	mut                  sync.RWMutex
+	current              []upgrade.Release
+	latestRel, latestPre string
 }
 
 func (c *cachedReleases) Releases() []upgrade.Release {
@@ -270,17 +282,35 @@ func (c *cachedReleases) Releases() []upgrade.Release {
 }
 
 func (c *cachedReleases) Update(ctx context.Context) error {
-	rels, err := fetchGithubReleases(ctx, c.url)
+	rels, err := fetchGithubReleases(ctx, c.url, c.assetURLTemplate)
 	if err != nil {
 		return err
 	}
+	latestRel, latestPre := "", ""
+	for _, rel := range rels {
+		if !rel.Prerelease && latestRel == "" {
+			latestRel = rel.Tag
+		}
+		if rel.Prerelease && latestPre == "" {
+			latestPre = rel.Tag
+		}
+		if latestRel != "" && latestPre != "" {
+			break
+		}
+	}
 	c.mut.Lock()
 	c.current = rels
+	if latestRel != c.latestRel || latestPre != c.latestPre {
+		metricLatestReleaseInfo.DeleteLabelValues(c.latestRel, c.latestPre)
+		metricLatestReleaseInfo.WithLabelValues(latestRel, latestPre).Set(1)
+		c.latestRel = latestRel
+		c.latestPre = latestPre
+	}
 	c.mut.Unlock()
 	return nil
 }
 
-func fetchGithubReleases(ctx context.Context, url string) ([]upgrade.Release, error) {
+func fetchGithubReleases(ctx context.Context, url, assetURLTemplate string) ([]upgrade.Release, error) {
 	req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, url, nil)
 	if err != nil {
 		metricHTTPRequests.WithLabelValues("github-releases", "error").Inc()
@@ -299,12 +329,25 @@ func fetchGithubReleases(ctx context.Context, url string) ([]upgrade.Release, er
 	}
 	metricHTTPRequests.WithLabelValues("github-releases", "success").Inc()
 
+	tpl, err := template.New("asset").Parse(assetURLTemplate)
+	if err != nil {
+		return nil, err
+	}
+
 	// Move the URL used for browser downloads to the URL field, and remove
 	// the browser URL field. This avoids going via the GitHub API for
 	// downloads, since Syncthing uses the URL field.
 	for _, rel := range rels {
 		for j, asset := range rel.Assets {
-			rel.Assets[j].URL = asset.BrowserURL
+			if assetURLTemplate != "" {
+				buf := new(bytes.Buffer)
+				if err := tpl.Execute(buf, map[string]any{"Release": rel, "Asset": asset}); err != nil {
+					return nil, err
+				}
+				rel.Assets[j].URL = buf.String()
+			} else {
+				rel.Assets[j].URL = asset.BrowserURL
+			}
 			rel.Assets[j].BrowserURL = ""
 		}
 	}

@@ -4,22 +4,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-package toplevel
+package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"syscall"
 	"time"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
 )
 
 func startHeapProfiler() {
-	l.Debugln("Starting heap profiling")
+	slog.Debug("Starting heap profiling")
 	go func() {
 		err := saveHeapProfiles(1) // Only returns on error
-		l.Warnln("Heap profiler failed:", err)
+		slog.Error("Heap profiler failed", slogutil.Error(err))
 		panic("Heap profiler failed")
 	}()
 }

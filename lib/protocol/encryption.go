@@ -17,13 +17,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gogo/protobuf/proto"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/miscreant/miscreant.go"
-	"github.com/syncthing/syncthing/lib/rand"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/scrypt"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/gen/bep"
+	"github.com/syncthing/syncthing/lib/rand"
 )
 
 const (
@@ -48,10 +50,10 @@ type encryptedModel struct {
 	keyGen     *KeyGenerator
 }
 
-func newEncryptedModel(model rawModel, folderKeys *folderKeyRegistry, keyGen *KeyGenerator) encryptedModel {
+func newEncryptedModel(model rawModel, keyGen *KeyGenerator) encryptedModel {
 	return encryptedModel{
 		model:      model,
-		folderKeys: folderKeys,
+		folderKeys: newFolderKeyRegistry(),
 		keyGen:     keyGen,
 	}
 }
@@ -91,31 +93,25 @@ func (e encryptedModel) Request(req *Request) (RequestResponse, error) {
 	}
 	realSize := req.Size - blockOverhead
 	realOffset := req.Offset - int64(req.BlockNo*blockOverhead)
+	if realOffset < 0 {
+		panic("bug: realOffset underflow")
+	}
 
 	if req.Size < minPaddedSize {
 		return nil, errors.New("short request")
 	}
 
-	// Attempt to decrypt the block hash; it may be nil depending on what
-	// type of device the request comes from. Trusted devices with
-	// encryption enabled know the hash but don't bother to encrypt & send
-	// it to us. Untrusted devices have the hash from the encrypted index
-	// data and do send it. The model knows to only verify the hash if it
-	// actually gets one.
-
-	var realHash []byte
+	// Decrypt the block hash.
 	fileKey := e.keyGen.FileKey(realName, folderKey)
-	if len(req.Hash) > 0 {
-		var additional [8]byte
-		binary.BigEndian.PutUint64(additional[:], uint64(realOffset))
-		realHash, err = decryptDeterministic(req.Hash, fileKey, additional[:])
-		if err != nil {
-			// "Legacy", no offset additional data?
-			realHash, err = decryptDeterministic(req.Hash, fileKey, nil)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("decrypting block hash: %w", err)
-		}
+	var additional [8]byte
+	binary.BigEndian.PutUint64(additional[:], uint64(realOffset))
+	realHash, err := decryptDeterministic(req.Hash, fileKey, additional[:])
+	if err != nil {
+		// "Legacy", no offset additional data?
+		realHash, err = decryptDeterministic(req.Hash, fileKey, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decrypting block hash: %w", err)
 	}
 
 	// Perform that request and grab the data.
@@ -151,7 +147,9 @@ func (e encryptedModel) DownloadProgress(p *DownloadProgress) error {
 		return e.model.DownloadProgress(p)
 	}
 
-	// Encrypted devices shouldn't send these - ignore them.
+	// We currently ignore these, though we could in principle translate
+	// them and use partially downloaded encrypted files like we do normal
+	// files.
 	return nil
 }
 
@@ -167,6 +165,7 @@ func (e encryptedModel) Closed(err error) {
 // encrypts outgoing metadata and decrypts incoming responses.
 type encryptedConnection struct {
 	ConnectionInfo
+
 	conn       *rawConnection
 	folderKeys *folderKeyRegistry
 	keyGen     *KeyGenerator
@@ -183,10 +182,6 @@ func newEncryptedConnection(ci ConnectionInfo, conn *rawConnection, folderKeys *
 
 func (e encryptedConnection) Start() {
 	e.conn.Start()
-}
-
-func (e encryptedConnection) SetFolderPasswords(passwords map[string]string) {
-	e.folderKeys.setPasswords(passwords)
 }
 
 func (e encryptedConnection) DeviceID() DeviceID {
@@ -212,38 +207,42 @@ func (e encryptedConnection) Request(ctx context.Context, req *Request) ([]byte,
 	if !ok {
 		return e.conn.Request(ctx, req)
 	}
+	fileKey := e.keyGen.FileKey(req.Name, folderKey)
 
 	// Encrypt / adjust the request parameters.
 
-	origSize := req.Size
-	origName := req.Name
-	if req.Size < minPaddedSize {
+	encSize := max(req.Size,
 		// Make a request for minPaddedSize data instead of the smaller
 		// block. We'll chop of the extra data later.
-		req.Size = minPaddedSize
-	}
+		minPaddedSize)
+	encSize += blockOverhead
 	encName := encryptName(req.Name, folderKey)
 	encOffset := req.Offset + int64(req.BlockNo*blockOverhead)
-	encSize := req.Size + blockOverhead
+	encHash := encryptBlockHash(req.Hash, req.Offset, fileKey)
 
 	// Perform that request, getting back an encrypted block.
 
-	req.Name = encName
-	req.Offset = encOffset
-	req.Size = encSize
-	bs, err := e.conn.Request(ctx, req)
+	encReq := &Request{
+		ID:      req.ID,
+		Folder:  req.Folder,
+		Name:    encName,
+		Offset:  encOffset,
+		Size:    encSize,
+		Hash:    encHash,
+		BlockNo: req.BlockNo,
+	}
+	bs, err := e.conn.Request(ctx, encReq)
 	if err != nil {
 		return nil, err
 	}
 
 	// Return the decrypted block (or an error if it fails decryption)
 
-	fileKey := e.keyGen.FileKey(origName, folderKey)
 	bs, err = DecryptBytes(bs, fileKey)
 	if err != nil {
 		return nil, err
 	}
-	return bs[:origSize], nil
+	return bs[:req.Size], nil
 }
 
 func (e encryptedConnection) DownloadProgress(ctx context.Context, dp *DownloadProgress) {
@@ -254,8 +253,9 @@ func (e encryptedConnection) DownloadProgress(ctx context.Context, dp *DownloadP
 	// No need to send these
 }
 
-func (e encryptedConnection) ClusterConfig(config *ClusterConfig) {
-	e.conn.ClusterConfig(config)
+func (e encryptedConnection) ClusterConfig(config *ClusterConfig, passwords map[string]string) {
+	e.folderKeys.setPasswords(e.keyGen, passwords)
+	e.conn.ClusterConfig(config, passwords)
 }
 
 func (e encryptedConnection) Close(err error) {
@@ -284,7 +284,7 @@ func encryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 	// The entire FileInfo is encrypted with a random nonce, and concatenated
 	// with that nonce.
 
-	bs, err := proto.Marshal(&fi)
+	bs, err := proto.Marshal(fi.ToWire(false))
 	if err != nil {
 		panic("impossible serialization mishap: " + err.Error())
 	}
@@ -327,15 +327,7 @@ func encryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 			b.Size = minPaddedSize
 		}
 		size := b.Size + blockOverhead
-
-		// The offset goes into the encrypted block hash as additional data,
-		// essentially mixing in with the nonce. This means a block hash
-		// remains stable for the same data at the same offset, but doesn't
-		// reveal the existence of identical data blocks at other offsets.
-		var additional [8]byte
-		binary.BigEndian.PutUint64(additional[:], uint64(b.Offset))
-		hash := encryptDeterministic(b.Hash, fileKey, additional[:])
-
+		hash := encryptBlockHash(b.Hash, b.Offset, fileKey)
 		blocks[i] = BlockInfo{
 			Hash:   hash,
 			Offset: offset,
@@ -360,18 +352,30 @@ func encryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 		Permissions: 0o644,
 		ModifiedS:   1234567890, // Sat Feb 14 00:31:30 CET 2009
 		Deleted:     fi.Deleted,
-		RawInvalid:  fi.IsInvalid(),
 		Version:     version,
 		Sequence:    fi.Sequence,
 		Encrypted:   encryptedFI,
 	}
+	if fi.IsInvalid() {
+		enc.LocalFlags = FlagLocalRemoteInvalid
+	}
 	if typ == FileInfoTypeFile {
 		enc.Size = offset // new total file size
 		enc.Blocks = blocks
-		enc.RawBlockSize = fi.BlockSize() + blockOverhead
+		enc.RawBlockSize = int32(fi.BlockSize() + blockOverhead)
 	}
 
 	return enc
+}
+
+func encryptBlockHash(hash []byte, offset int64, fileKey *[keySize]byte) []byte {
+	// The offset goes into the encrypted block hash as additional data,
+	// essentially mixing in with the nonce. This means a block hash
+	// remains stable for the same data at the same offset, but doesn't
+	// reveal the existence of identical data blocks at other offsets.
+	var additional [8]byte
+	binary.BigEndian.PutUint64(additional[:], uint64(offset))
+	return encryptDeterministic(hash, fileKey, additional[:])
 }
 
 func decryptFileInfos(keyGen *KeyGenerator, files []FileInfo, folderKey *[keySize]byte) error {
@@ -399,7 +403,7 @@ func DecryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 		return FileInfo{}, err
 	}
 
-	var decFI FileInfo
+	var decFI bep.FileInfo
 	if err := proto.Unmarshal(dec, &decFI); err != nil {
 		return FileInfo{}, err
 	}
@@ -407,7 +411,7 @@ func DecryptFileInfo(keyGen *KeyGenerator, fi FileInfo, folderKey *[keySize]byte
 	// Preserve sequence, which is legitimately controlled by the untrusted device
 	decFI.Sequence = fi.Sequence
 
-	return decFI, nil
+	return FileInfoFromWire(&decFI), nil
 }
 
 var base32Hex = base32.HexEncoding.WithPadding(base32.NoPadding)
@@ -670,15 +674,13 @@ func IsEncryptedParent(pathComponents []string) bool {
 }
 
 type folderKeyRegistry struct {
-	keyGen *KeyGenerator
-	keys   map[string]*[keySize]byte // folder ID -> key
-	mut    sync.RWMutex
+	keys map[string]*[keySize]byte // folder ID -> key
+	mut  sync.RWMutex
 }
 
-func newFolderKeyRegistry(keyGen *KeyGenerator, passwords map[string]string) *folderKeyRegistry {
+func newFolderKeyRegistry() *folderKeyRegistry {
 	return &folderKeyRegistry{
-		keyGen: keyGen,
-		keys:   keysFromPasswords(keyGen, passwords),
+		keys: make(map[string]*[keySize]byte),
 	}
 }
 
@@ -689,8 +691,8 @@ func (r *folderKeyRegistry) get(folder string) (*[keySize]byte, bool) {
 	return key, ok
 }
 
-func (r *folderKeyRegistry) setPasswords(passwords map[string]string) {
+func (r *folderKeyRegistry) setPasswords(keyGen *KeyGenerator, passwords map[string]string) {
 	r.mut.Lock()
-	r.keys = keysFromPasswords(r.keyGen, passwords)
+	r.keys = keysFromPasswords(keyGen, passwords)
 	r.mut.Unlock()
 }

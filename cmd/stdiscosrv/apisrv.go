@@ -18,16 +18,19 @@ import (
 	"fmt"
 	io "io"
 	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/internal/gen/discosrv"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/stringutil"
 )
@@ -52,7 +55,7 @@ type apiSrv struct {
 }
 
 type replicator interface {
-	send(key *protocol.DeviceID, addrs []DatabaseAddress, seen int64)
+	send(key *protocol.DeviceID, addrs []*discosrv.DatabaseAddress, seen int64)
 }
 
 type requestID int64
@@ -65,7 +68,7 @@ type contextKey int
 
 const idKey contextKey = iota
 
-func newAPISrv(addr string, cert tls.Certificate, db database, repl replicator, useHTTP, compression bool) *apiSrv {
+func newAPISrv(addr string, cert tls.Certificate, db database, repl replicator, useHTTP, compression bool, desiredUnseenNotFoundRate, desiredSeenNotFoundRate float64) *apiSrv {
 	return &apiSrv{
 		addr:        addr,
 		cert:        cert,
@@ -76,13 +79,13 @@ func newAPISrv(addr string, cert tls.Certificate, db database, repl replicator, 
 		seenTracker: &retryAfterTracker{
 			name:         "seenTracker",
 			bucketStarts: time.Now(),
-			desiredRate:  250,
+			desiredRate:  desiredSeenNotFoundRate,
 			currentDelay: notFoundRetryUnknownMinSeconds,
 		},
 		notSeenTracker: &retryAfterTracker{
 			name:         "notSeenTracker",
 			bucketStarts: time.Now(),
-			desiredRate:  250,
+			desiredRate:  desiredUnseenNotFoundRate,
 			currentDelay: notFoundRetryUnknownMaxSeconds / 2,
 		},
 	}
@@ -92,7 +95,7 @@ func (s *apiSrv) Serve(ctx context.Context) error {
 	if s.useHTTP {
 		listener, err := net.Listen("tcp", s.addr)
 		if err != nil {
-			log.Println("Listen:", err)
+			slog.ErrorContext(ctx, "Failed to listen", "error", err)
 			return err
 		}
 		s.listener = listener
@@ -106,7 +109,7 @@ func (s *apiSrv) Serve(ctx context.Context) error {
 
 		tlsListener, err := tls.Listen("tcp", s.addr, tlsCfg)
 		if err != nil {
-			log.Println("Listen:", err)
+			slog.ErrorContext(ctx, "Failed to listen", "error", err)
 			return err
 		}
 		s.listener = tlsListener
@@ -119,7 +122,9 @@ func (s *apiSrv) Serve(ctx context.Context) error {
 		ReadTimeout:    httpReadTimeout,
 		WriteTimeout:   httpWriteTimeout,
 		MaxHeaderBytes: httpMaxHeaderBytes,
-		ErrorLog:       log.New(io.Discard, "", 0),
+	}
+	if !debug {
+		srv.ErrorLog = log.New(io.Discard, "", 0)
 	}
 
 	go func() {
@@ -129,7 +134,7 @@ func (s *apiSrv) Serve(ctx context.Context) error {
 
 	err := srv.Serve(s.listener)
 	if err != nil {
-		log.Println("Serve:", err)
+		slog.ErrorContext(ctx, "Failed to serve", "error", err)
 	}
 	return err
 }
@@ -148,30 +153,17 @@ func (s *apiSrv) handler(w http.ResponseWriter, req *http.Request) {
 	reqID := requestID(rand.Int63())
 	req = req.WithContext(context.WithValue(req.Context(), idKey, reqID))
 
-	if debug {
-		log.Println(reqID, req.Method, req.URL, req.Proto)
-	}
+	slog.Debug("Handling request", "id", reqID, "method", req.Method, "url", req.URL, "proto", req.Proto)
 
-	remoteAddr := &net.TCPAddr{
-		IP:   nil,
-		Port: -1,
-	}
-
+	var remoteAddr *net.TCPAddr
 	if s.useHTTP {
 		// X-Forwarded-For can have multiple client IPs; split using the comma separator
-		forwardIP, _, _ := strings.Cut(req.Header.Get("X-Forwarded-For"), ",")
-
-		// net.ParseIP will return nil if leading/trailing whitespace exists; use strings.TrimSpace()
-		remoteAddr.IP = net.ParseIP(strings.TrimSpace(forwardIP))
-
-		if parsedPort, err := strconv.ParseInt(req.Header.Get("X-Client-Port"), 10, 0); err == nil {
-			remoteAddr.Port = int(parsedPort)
-		}
+		remoteAddr = forwardedRemoteAddr(req)
 	} else {
 		var err error
 		remoteAddr, err = net.ResolveTCPAddr("tcp", req.RemoteAddr)
 		if err != nil {
-			log.Println("remoteAddr:", err)
+			slog.Warn("Failed to resolve remote address", "address", req.RemoteAddr, "error", err)
 			lw.Header().Set("Retry-After", errorRetryAfterString())
 			http.Error(lw, "Internal Server Error", http.StatusInternalServerError)
 			apiRequestsTotal.WithLabelValues("no_remote_addr").Inc()
@@ -189,14 +181,27 @@ func (s *apiSrv) handler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func forwardedRemoteAddr(req *http.Request) *net.TCPAddr {
+	forwardIP, _, _ := strings.Cut(req.Header.Get("X-Forwarded-For"), ",")
+
+	remoteAddr := &net.TCPAddr{
+		IP:   net.ParseIP(strings.TrimSpace(forwardIP)),
+		Port: -1,
+	}
+
+	if parsedPort, err := strconv.ParseInt(req.Header.Get("X-Client-Port"), 10, 0); err == nil {
+		remoteAddr.Port = int(parsedPort)
+	}
+
+	return remoteAddr
+}
+
 func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 	reqID := req.Context().Value(idKey).(requestID)
 
 	deviceID, err := protocol.DeviceIDFromString(req.URL.Query().Get("device"))
 	if err != nil {
-		if debug {
-			log.Println(reqID, "bad device param")
-		}
+		slog.Debug("Request with bad device param", "id", reqID, "error", err)
 		lookupRequestsTotal.WithLabelValues("bad_request").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -206,6 +211,7 @@ func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 	rec, err := s.db.get(&deviceID)
 	if err != nil {
 		// some sort of internal error
+		slog.Warn("Failed to handle GET request", "id", reqID, "error", err)
 		lookupRequestsTotal.WithLabelValues("internal_error").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -254,11 +260,9 @@ func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req *http.Request) {
 	reqID := req.Context().Value(idKey).(requestID)
 
-	rawCert, err := certificateBytes(req)
+	rawCert, err := s.certificateBytes(req)
 	if err != nil {
-		if debug {
-			log.Println(reqID, "no certificates:", err)
-		}
+		slog.Debug("Request without certificates", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("no_certificate").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Forbidden", http.StatusForbidden)
@@ -267,9 +271,7 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 
 	var ann announcement
 	if err := json.NewDecoder(req.Body).Decode(&ann); err != nil {
-		if debug {
-			log.Println(reqID, "decode:", err)
-		}
+		slog.Debug("Failed to decode request", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("bad_request").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -280,6 +282,7 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 
 	addresses := fixupAddresses(remoteAddr, ann.Addresses)
 	if len(addresses) == 0 {
+		slog.Debug("Request without addresses", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("bad_request").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -287,6 +290,7 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 	}
 
 	if err := s.handleAnnounce(deviceID, addresses); err != nil {
+		slog.Warn("Failed to handle POST request", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("internal_error").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -297,6 +301,7 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 
 	w.Header().Set("Reannounce-After", reannounceAfterString())
 	w.WriteHeader(http.StatusNoContent)
+	slog.Debug("Device announced", "id", reqID, "device", deviceID, "addresses", addresses)
 }
 
 func (s *apiSrv) Stop() {
@@ -312,10 +317,12 @@ func (s *apiSrv) handleAnnounce(deviceID protocol.DeviceID, addresses []string) 
 	slices.Sort(addresses)
 	addresses = slices.Compact(addresses)
 
-	dbAddrs := make([]DatabaseAddress, len(addresses))
+	dbAddrs := make([]*discosrv.DatabaseAddress, len(addresses))
 	for i := range addresses {
-		dbAddrs[i].Address = addresses[i]
-		dbAddrs[i].Expires = expire
+		dbAddrs[i] = &discosrv.DatabaseAddress{
+			Address: addresses[i],
+			Expires: expire,
+		}
 	}
 
 	seen := now.UnixNano()
@@ -325,18 +332,25 @@ func (s *apiSrv) handleAnnounce(deviceID protocol.DeviceID, addresses []string) 
 	return s.db.merge(&deviceID, dbAddrs, seen)
 }
 
-func handlePing(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(204)
+func handlePing(w http.ResponseWriter, req *http.Request) {
+	hostname, _ := os.Hostname()
+	w.Header().Set("Discovery-Server-Instance", hostname)
+	w.Header().Set("Discovery-Client-Address", req.RemoteAddr)
+	w.Header().Set("Discovery-Client-Remote", forwardedRemoteAddr(req).String())
+	w.WriteHeader(http.StatusNoContent)
 }
 
-func certificateBytes(req *http.Request) ([]byte, error) {
+func (s *apiSrv) certificateBytes(req *http.Request) ([]byte, error) {
 	if req.TLS != nil && len(req.TLS.PeerCertificates) > 0 {
 		return req.TLS.PeerCertificates[0].Raw, nil
+	}
+	if !s.useHTTP {
+		return nil, errors.New("no certificate presented")
 	}
 
 	var bs []byte
 
-	if hdr := req.Header.Get("X-SSL-Cert"); hdr != "" {
+	if hdr := req.Header.Get("X-Ssl-Cert"); hdr != "" {
 		if strings.Contains(hdr, "%") {
 			// Nginx using $ssl_client_escaped_cert
 			// The certificate is in PEM format with url encoding.
@@ -398,10 +412,7 @@ func certificateBytes(req *http.Request) ([]byte, error) {
 		b.WriteByte('\n')
 
 		for i := 0; i < len(cert); i += 64 {
-			end := i + 64
-			if end > len(cert) {
-				end = len(cert)
-			}
+			end := min(i+64, len(cert))
 			b.WriteString(cert[i:end])
 			b.WriteByte('\n')
 		}
@@ -499,6 +510,7 @@ func fixupAddresses(remote *net.TCPAddr, addresses []string) []string {
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
+
 	statusCode int
 }
 
@@ -511,7 +523,7 @@ func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 }
 
-func addressStrs(dbAddrs []DatabaseAddress) []string {
+func addressStrs(dbAddrs []*discosrv.DatabaseAddress) []string {
 	res := make([]string, len(dbAddrs))
 	for i, a := range dbAddrs {
 		res[i] = a.Address
@@ -562,5 +574,17 @@ func (t *retryAfterTracker) retryAfterS() int {
 	}
 	t.curCount++
 	t.mut.Unlock()
-	return t.currentDelay + rand.Intn(t.currentDelay/4)
+
+	// Skewed normal distribution with the mean at currentDelay and the
+	// limits (50% and 150%) at 3 standard deviations
+	nf := rand.NormFloat64()
+	minD := max(notFoundRetryUnknownMinSeconds, t.currentDelay/2)
+	maxD := min(notFoundRetryUnknownMaxSeconds, t.currentDelay*3/2)
+	intv := float64(maxD - t.currentDelay)
+	if nf < 0 {
+		intv = float64(t.currentDelay - minD)
+	}
+	nf = min(max(nf*intv/3+float64(t.currentDelay), notFoundRetryUnknownMinSeconds), notFoundRetryUnknownMaxSeconds)
+
+	return int(nf)
 }

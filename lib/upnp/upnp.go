@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,6 +48,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/netutil"
 
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/dialer"
@@ -82,7 +86,7 @@ type UnsupportedDeviceTypeError struct {
 }
 
 func (e *UnsupportedDeviceTypeError) Error() string {
-	return fmt.Sprintf("Unsupported UPnP device of type %s", e.deviceType)
+	return "unsupported UPnP device of type " + e.deviceType
 }
 
 const (
@@ -104,9 +108,9 @@ const (
 func Discover(ctx context.Context, _, timeout time.Duration) []nat.Device {
 	var results []nat.Device
 
-	interfaces, err := net.Interfaces()
+	interfaces, err := netutil.Interfaces()
 	if err != nil {
-		l.Infoln("Listing network interfaces:", err)
+		slog.WarnContext(ctx, "Failed to list network interfaces", slogutil.Error(err))
 		return results
 	}
 
@@ -119,28 +123,26 @@ func Discover(ctx context.Context, _, timeout time.Duration) []nat.Device {
 			continue
 		}
 
-		wg.Add(1)
 		// Discovery is done sequentially per interface because we discovered that
 		// FritzBox routers return a broken result sometimes if the IPv4 and IPv6
 		// request arrive at the same time.
-		go func(iface net.Interface) {
-			defer wg.Done()
-			hasGUA, err := interfaceHasGUAIPv6(iface)
+		wg.Go(func() {
+			hasGUA, err := interfaceHasGUAIPv6(intf)
 			if err != nil {
-				l.Debugf("Couldn't check for IPv6 GUAs on %s: %s", iface.Name, err)
+				l.Debugf("Couldn't check for IPv6 GUAs on %s: %s", intf.Name, err) //nolint:contextcheck
 			} else if hasGUA {
 				// Discover IPv6 gateways on interface. Only discover IGDv2, since IGDv1
 				// + IPv6 is not standardized and will lead to duplicates on routers.
 				// Only do this when a non-link-local IPv6 is available. if we can't
 				// enumerate the interface, the IPv6 code will not work anyway
-				discover(ctx, &iface, urnIgdV2, timeout, resultChan, true)
+				discover(ctx, &intf, urnIgdV2, timeout, resultChan, true)
 			}
 
 			// Discover IPv4 gateways on interface.
 			for _, deviceType := range []string{urnIgdV2, urnIgdV1} {
-				discover(ctx, &iface, deviceType, timeout, resultChan, false)
+				discover(ctx, &intf, deviceType, timeout, resultChan, false)
 			}
-		}(intf)
+		})
 	}
 
 	go func() {
@@ -210,11 +212,10 @@ USER-AGENT: syncthing/%s
 		proto = "udp6"
 	}
 	socket, err := net.ListenMulticastUDP(proto, intf, &net.UDPAddr{IP: ssdp.IP})
-
 	if err != nil {
 		if runtime.GOOS == "windows" && ip6 {
 			// Requires https://github.com/golang/go/issues/63529 to be fixed.
-			l.Infoln("Support for IPv6 UPnP is currently not available on Windows:", err)
+			slog.InfoContext(ctx, "Support for IPv6 UPnP is currently not available on Windows", slogutil.Error(err))
 		} else {
 			l.Debugln("UPnP discovery: listening to udp multicast:", err)
 		}
@@ -226,7 +227,8 @@ USER-AGENT: syncthing/%s
 
 	_, err = socket.WriteTo(search, &ssdp)
 	if err != nil {
-		if e, ok := err.(net.Error); !ok || !e.Timeout() {
+		var e net.Error
+		if !errors.As(err, &e) || !e.Timeout() {
 			l.Debugln("UPnP discovery: sending search request:", err)
 		}
 		return
@@ -243,7 +245,7 @@ USER-AGENT: syncthing/%s
 loop:
 	for {
 		if err := socket.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
-			l.Infoln("UPnP socket:", err)
+			slog.WarnContext(ctx, "Failed to set UPnP socket deadline", slogutil.Error(err))
 			break
 		}
 
@@ -254,27 +256,25 @@ loop:
 				break loop
 			default:
 			}
-			if e, ok := err.(net.Error); ok && e.Timeout() {
+			var ne net.Error
+			if ok := errors.As(err, &ne); ok && ne.Timeout() {
 				continue // continue reading
 			}
-			l.Infoln("UPnP read:", err) //legitimate error, not a timeout.
+			slog.WarnContext(ctx, "Failed to read from UPnP socket", slogutil.Error(err)) // legitimate error, not a timeout.
 			break
 		}
 
 		igds, err := parseResponse(ctx, deviceType, udpAddr, resp[:n], intf)
 		if err != nil {
-			switch err.(type) {
-			case *UnsupportedDeviceTypeError:
+			var unsupp *UnsupportedDeviceTypeError
+			if errors.As(err, &unsupp) {
 				l.Debugln(err.Error())
-			default:
-				if !errors.Is(err, context.Canceled) {
-					l.Infoln("UPnP parse:", err)
-				}
+			} else if !errors.Is(err, context.Canceled) {
+				slog.WarnContext(ctx, "Failed to parse UPnP response", slogutil.Error(err))
 			}
 			continue
 		}
 		for _, igd := range igds {
-			igd := igd // Copy before sending pointer to the channel.
 			select {
 			case results <- &igd:
 			case <-ctx.Done():
@@ -307,16 +307,11 @@ func parseResponse(ctx context.Context, deviceType string, addr *net.UDPAddr, re
 
 	deviceDescriptionURL, err := url.Parse(deviceDescriptionLocation)
 	if err != nil {
-		l.Infoln("Invalid IGD location: " + err.Error())
+		slog.WarnContext(ctx, "Got invalid IGD location", slogutil.Error(err))
 		return nil, err
 	}
 
-	if err != nil {
-		l.Infoln("Invalid source IP for IGD: " + err.Error())
-		return nil, err
-	}
-
-	deviceUSN := response.Header.Get("USN")
+	deviceUSN := response.Header.Get("Usn")
 	if deviceUSN == "" {
 		return nil, errors.New("invalid IGD response: USN not specified")
 	}
@@ -342,7 +337,12 @@ func parseResponse(ctx context.Context, deviceType string, addr *net.UDPAddr, re
 	}
 
 	deviceUUID := strings.TrimPrefix(strings.Split(deviceUSN, "::")[0], "uuid:")
-	response, err = http.Get(deviceDescriptionLocation)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deviceDescriptionLocation, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", build.UserAgent())
+	response, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +367,7 @@ func parseResponse(ctx context.Context, deviceType string, addr *net.UDPAddr, re
 		// we are on an IPv6-only network though, so don't error out in case pinholing is available.
 		localIPv4Address, err = localIPv4Fallback(ctx, deviceDescriptionURL)
 		if err != nil {
-			l.Infoln("Unable to determine local IPv4 address for IGD: " + err.Error())
+			slog.WarnContext(ctx, "Unable to determine local IPv4 address for IGD", slogutil.Error(err))
 		}
 	}
 
@@ -387,7 +387,7 @@ func parseResponse(ctx context.Context, deviceType string, addr *net.UDPAddr, re
 }
 
 func localIPv4(netInterface *net.Interface) (net.IP, error) {
-	addrs, err := netInterface.Addrs()
+	addrs, err := netutil.InterfaceAddrsByInterface(netInterface)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +411,6 @@ func localIPv4Fallback(ctx context.Context, url *url.URL) (net.IP, error) {
 	defer cancel()
 
 	conn, err := dialer.DialContext(timeoutCtx, "udp4", url.Host)
-
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +495,7 @@ func getIGDServices(deviceUUID string, localIPAddress net.IP, rootURL string, de
 	devices := getChildDevices(device, wanDeviceURN)
 
 	if len(devices) < 1 {
-		l.Infoln(rootURL, "- malformed InternetGatewayDevice description: no WANDevices specified.")
+		slog.Warn("Got malformed InternetGatewayDevice description: no WANDevices specified")
 		return result
 	}
 
@@ -504,20 +503,20 @@ func getIGDServices(deviceUUID string, localIPAddress net.IP, rootURL string, de
 		connections := getChildDevices(device, wanConnectionURN)
 
 		if len(connections) < 1 {
-			l.Infoln(rootURL, "- malformed ", wanDeviceURN, "description: no WANConnectionDevices specified.")
+			slog.Warn("Got malformed WAN device description: no WANConnectionDevices specified", "urn", wanDeviceURN)
 		}
 
 		for _, connection := range connections {
-			for _, URN := range URNs {
-				services := getChildServices(connection, URN)
+			for _, urn := range URNs {
+				services := getChildServices(connection, urn)
 
 				if len(services) == 0 {
-					l.Debugln(rootURL, "- no services of type", URN, " found on connection.")
+					l.Debugln(rootURL, "- no services of type", urn, " found on connection.")
 				}
 
 				for _, service := range services {
 					if service.ControlURL == "" {
-						l.Infoln(rootURL+"- malformed", service.Type, "description: no control URL.")
+						slog.Warn("Gor malformed service description: no control URL", "service", service.Type)
 					} else {
 						u, _ := url.Parse(rootURL)
 						replaceRawPath(u, service.ControlURL)
@@ -559,7 +558,7 @@ func replaceRawPath(u *url.URL, rp string) {
 			q = fs[1]
 		}
 
-		if p[0] == '/' {
+		if p != "" && p[0] == '/' {
 			u.Path = p
 		} else {
 			u.Path += p
@@ -582,13 +581,13 @@ func soapRequestWithIP(ctx context.Context, url, service, function, message stri
 
 	body := fmt.Sprintf(template, message)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
 		return resp, err
 	}
 	req.Close = true
 	req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
-	req.Header.Set("User-Agent", "syncthing/1.0")
+	req.Header.Set("User-Agent", build.UserAgent())
 	req.Header["SOAPAction"] = []string{fmt.Sprintf(`"%s#%s"`, service, function)} // Enforce capitalization in header-entry for sensitive routers. See issue #1696
 	req.Header.Set("Connection", "Close")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -612,16 +611,15 @@ func soapRequestWithIP(ctx context.Context, url, service, function, message stri
 		l.Debugln("SOAP do:", err)
 		return resp, err
 	}
+	defer r.Body.Close()
 
 	resp, err = io.ReadAll(r.Body)
 	if err != nil {
-		l.Debugf("Error reading SOAP response: %s, partial response (if present):\n\n%s", resp)
+		l.Debugf("Error reading SOAP response: %v, partial response (if present):\n\n%s", err, resp)
 		return resp, err
 	}
 
 	l.Debugf("SOAP Response: %s\n\n%s\n\n", r.Status, resp)
-
-	r.Body.Close()
 
 	if r.StatusCode >= 400 {
 		return resp, errors.New(function + ": " + r.Status)
@@ -631,7 +629,7 @@ func soapRequestWithIP(ctx context.Context, url, service, function, message stri
 }
 
 func interfaceHasGUAIPv6(intf net.Interface) (bool, error) {
-	addrs, err := intf.Addrs()
+	addrs, err := netutil.InterfaceAddrsByInterface(&intf)
 	if err != nil {
 		return false, err
 	}

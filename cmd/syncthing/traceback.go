@@ -5,9 +5,8 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build go1.7
-// +build go1.7
 
-package toplevel
+package main
 
 import "runtime/debug"
 

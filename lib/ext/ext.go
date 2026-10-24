@@ -12,7 +12,7 @@ import (
 
 type ExtCallback interface {
 	ExtCheckAvailableSpace(req uint64) bool
-	ExtNewFilesystem(path string) fs.Filesystem
+	ExtNewFilesystem(folderID, folderType, path string) fs.Filesystem
 	ExtAccessPath(path string) string
 }
 

@@ -13,8 +13,7 @@ import (
 )
 
 func TestExternalIPParsing(t *testing.T) {
-	soapResponse :=
-		[]byte(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+	soapResponse := []byte(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 		<s:Body>
 			<u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
 			<NewExternalIPAddress>1.2.3.4</NewExternalIPAddress>
@@ -34,8 +33,7 @@ func TestExternalIPParsing(t *testing.T) {
 }
 
 func TestSoapFaultParsing(t *testing.T) {
-	soapResponse :=
-		[]byte(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+	soapResponse := []byte(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 		<s:Body>
 			<s:Fault>
 				<faultcode>s:Client</faultcode>
@@ -75,6 +73,19 @@ func TestControlURLParsing(t *testing.T) {
 	u, _ = url.Parse(rootURL)
 	subject = "http://192.168.243.1:80/upnp?control=WANCommonIFC1"
 	expected = "http://192.168.243.1:80/upnp?control=WANCommonIFC1"
+	replaceRawPath(u, subject)
+
+	if u.String() != expected {
+		t.Error("URL normalization of", subject, "failed; expected", expected, "got", u.String())
+	}
+}
+
+func TestControlURLParsingQueryOnly(t *testing.T) {
+	rootURL := "http://192.168.243.1:80/igd.xml"
+
+	u, _ := url.Parse(rootURL)
+	subject := "?control=WANCommonIFC1"
+	expected := "http://192.168.243.1:80/igd.xml?control=WANCommonIFC1"
 	replaceRawPath(u, subject)
 
 	if u.String() != expected {

@@ -10,13 +10,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 )
 
 type dynamicClient struct {
@@ -48,12 +50,13 @@ func (c *dynamicClient) serve(ctx context.Context) error {
 
 	l.Debugln(c, "looking up dynamic relays")
 
-	req, err := http.NewRequestWithContext(ctx, "GET", uri.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri.String(), nil)
 	if err != nil {
 		l.Debugln(c, "failed to lookup dynamic relays", err)
 		return err
 	}
-	data, err := http.DefaultClient.Do(req)
+	req.Header.Set("User-Agent", build.UserAgent())
+	data, err := tlsutil.ShortLivedHTTPClient.Do(req)
 	if err != nil {
 		l.Debugln(c, "failed to lookup dynamic relays", err)
 		return err
@@ -139,7 +142,7 @@ type dynamicAnnouncement struct {
 // relayAddressesOrder checks the latency to each relay, rounds latency down to
 // the closest 50ms, and puts them in buckets of 50ms latency ranges. Then
 // shuffles each bucket, and returns all addresses starting with the ones from
-// the lowest latency bucket, ending with the highest latency buceket.
+// the lowest latency bucket, ending with the highest latency bucket.
 func relayAddressesOrder(ctx context.Context, input []string) []string {
 	buckets := make(map[int][]string)
 
@@ -166,7 +169,7 @@ func relayAddressesOrder(ctx context.Context, input []string) []string {
 		ids = append(ids, id)
 	}
 
-	sort.Ints(ids)
+	slices.Sort(ids)
 
 	addresses := make([]string, 0, len(input))
 	for _, id := range ids {

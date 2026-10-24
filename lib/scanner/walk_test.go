@@ -16,18 +16,19 @@ import (
 	"os"
 	"path/filepath"
 	rdebug "runtime/debug"
-	"sort"
-	"sync"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/d4l3k/messagediff"
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"golang.org/x/text/unicode/norm"
 )
 
 type testfile struct {
@@ -40,9 +41,9 @@ type testfileList []testfile
 
 var testdata = testfileList{
 	{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
-	{"dir1", 128, ""},
+	{"dir1", 0, ""},
 	{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
-	{"dir2", 128, ""},
+	{"dir2", 0, ""},
 	{filepath.Join("dir2", "cfile"), 4, "bf07a7fbb825fc0aae7bf4a1177b2b31fcf8a3feeaf7092761e18c859ee52a9c"},
 	{"excludes", 37, "df90b52f0c55dba7a7a940affe482571563b1ac57bd5be4d8a0291e7de928e06"},
 	{"further-excludes", 5, "7eb0a548094fa6295f7fd9200d69973e5f5ec5c04f2a86d998080ac43ecf89f1"},
@@ -144,7 +145,7 @@ func TestWalk(t *testing.T) {
 		}
 		tmp = append(tmp, f.File)
 	}
-	sort.Sort(fileList(tmp))
+	slices.SortFunc(fileList(tmp), compareByName)
 	files := fileList(tmp).testfiles()
 
 	if diff, equal := messagediff.PrettyDiff(testdata, files); !equal {
@@ -161,7 +162,7 @@ func TestVerify(t *testing.T) {
 	progress := newByteCounter()
 	defer progress.Close()
 
-	blocks, err := Blocks(context.TODO(), buf, blocksize, -1, progress, false)
+	blocks, err := Blocks(context.TODO(), buf, blocksize, -1, progress)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,8 +239,12 @@ func TestNormalization(t *testing.T) {
 			if fd, err := testFs.OpenFile(filepath.Join("normalization", s1, s2), os.O_CREATE|os.O_EXCL, 0o644); err != nil {
 				t.Fatal(err)
 			} else {
-				fd.Write([]byte("test"))
-				fd.Close()
+				if _, err := fd.Write([]byte("test")); err != nil {
+					t.Fatal(err)
+				}
+				if err := fd.Close(); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}
@@ -362,7 +367,7 @@ func TestWalkSymlinkUnix(t *testing.T) {
 		if len(files[0].Blocks) != 0 {
 			t.Errorf("expected zero blocks for symlink, not %d", len(files[0].Blocks))
 		}
-		if files[0].SymlinkTarget != "../testdata" {
+		if string(files[0].SymlinkTarget) != "../testdata" {
 			t.Errorf("expected symlink to have target destination, not %q", files[0].SymlinkTarget)
 		}
 	}
@@ -561,7 +566,7 @@ func TestScanOwnershipWindows(t *testing.T) {
 	}
 }
 
-func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.Matcher, localFlags uint32) []protocol.FileInfo {
+func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.Matcher, localFlags protocol.FlagLocal) []protocol.FileInfo {
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Filesystem = fs
@@ -579,23 +584,15 @@ func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.
 			tmp = append(tmp, f.File)
 		}
 	}
-	sort.Sort(fileList(tmp))
+	slices.SortFunc(fileList(tmp), compareByName)
 
 	return tmp
 }
 
 type fileList []protocol.FileInfo
 
-func (l fileList) Len() int {
-	return len(l)
-}
-
-func (l fileList) Less(a, b int) bool {
-	return l[a].Name < l[b].Name
-}
-
-func (l fileList) Swap(a, b int) {
-	l[a], l[b] = l[b], l[a]
+func compareByName(a, b protocol.FileInfo) int {
+	return strings.Compare(a.Name, b.Name)
 }
 
 func (l fileList) testfiles() testfileList {
@@ -604,7 +601,7 @@ func (l fileList) testfiles() testfileList {
 		if len(f.Blocks) > 1 {
 			panic("simple test case stuff only supports a single block per file")
 		}
-		testfiles[i] = testfile{name: f.Name, length: f.FileSize()}
+		testfiles[i] = testfile{name: f.Name, length: f.Size}
 		if len(f.Blocks) == 1 {
 			testfiles[i].hash = fmt.Sprintf("%x", f.Blocks[0].Hash)
 		}
@@ -622,12 +619,9 @@ func (l testfileList) String() string {
 	return b.String()
 }
 
-var initOnce sync.Once
-
 const (
 	testdataSize = 17<<20 + 1
 	testdataName = "_random.data"
-	testFsPath   = "some_random_dir_path"
 )
 
 func BenchmarkHashFile(b *testing.B) {
@@ -635,7 +629,7 @@ func BenchmarkHashFile(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := HashFile(context.TODO(), "", testFs, testdataName, protocol.MinBlockSize, nil, true); err != nil {
+		if _, err := HashFile(context.TODO(), "", testFs, testdataName, protocol.MinBlockSize, nil); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -672,7 +666,7 @@ func TestStopWalk(t *testing.T) {
 
 	// Use an errorFs as the backing fs for the rest of the interface
 	// The way we get it is a bit hacky tho.
-	errorFs := fs.NewFilesystem(fs.FilesystemType(-1), ".")
+	errorFs := fs.NewFilesystem(fs.FilesystemType("error"), ".")
 	fs := fs.NewWalkFilesystem(&infiniteFS{errorFs, 100, 100, 1e6})
 
 	const numHashers = 4
@@ -719,13 +713,15 @@ func TestStopWalk(t *testing.T) {
 	// Empty out any waiting entries and wait for the channel to close.
 	// Count them, they should be zero or very few - essentially, each
 	// hasher has the choice of returning a fully handled entry or
-	// cancelling, but they should not start on another item.
+	// cancelling, but they should not start on another item. The scan
+	// goroutine can also have one directory entry in-flight on finishedChan
+	// (directories bypass the hashers).
 	extra := 0
 	for range fchan {
 		extra++
 	}
 	t.Log("Extra entries:", extra)
-	if extra > numHashers {
+	if extra > numHashers+1 {
 		t.Error("unexpected extra entries received after cancel")
 	}
 }
@@ -753,7 +749,7 @@ func TestRecurseInclude(t *testing.T) {
 	*
 	`
 	testFs := newTestFs()
-	ignores := ignore.New(testFs, ignore.WithCache(true))
+	ignores := ignore.New(testFs)
 	if err := ignores.Parse(bytes.NewBufferString(stignore), ".stignore"); err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +816,7 @@ func TestIssue4841(t *testing.T) {
 		}
 		files = append(files, f.File)
 	}
-	sort.Sort(fileList(files))
+	slices.SortFunc(fileList(files), compareByName)
 
 	if len(files) != 1 {
 		t.Fatalf("Expected 1 file, got %d: %v", len(files), files)
@@ -863,7 +859,7 @@ func TestSkipIgnoredDirs(t *testing.T) {
 
 	w := &walker{}
 
-	pats := ignore.New(fss, ignore.WithCache(true))
+	pats := ignore.New(fss)
 
 	stignore := `
 	/foo/ign*
@@ -896,7 +892,7 @@ func TestIncludedSubdir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pats := ignore.New(fss, ignore.WithCache(true))
+	pats := ignore.New(fss)
 
 	stignore := `
 	!/foo/bar
@@ -983,11 +979,11 @@ func testConfig() (Config, context.CancelFunc) {
 func BenchmarkWalk(b *testing.B) {
 	testFs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32))
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if err := testFs.Mkdir(fmt.Sprintf("dir%d", i), 0o755); err != nil {
 			b.Fatal(err)
 		}
-		for j := 0; j < 100; j++ {
+		for j := range 100 {
 			if fd, err := testFs.Create(fmt.Sprintf("dir%d/file%d", i, j)); err != nil {
 				b.Fatal(err)
 			} else {

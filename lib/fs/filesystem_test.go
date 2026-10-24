@@ -104,7 +104,7 @@ func TestCanonicalize(t *testing.T) {
 }
 
 func TestFileModeString(t *testing.T) {
-	var fm FileMode = 0777
+	var fm FileMode = 0o777
 	exp := "-rwxrwxrwx"
 	if fm.String() != exp {
 		t.Fatalf("Got %v, expected %v", fm.String(), exp)
@@ -189,7 +189,7 @@ func TestRepro9677MissingMtimeFS(t *testing.T) {
 	testTime := time.Unix(1723491493, 123456789)
 
 	// Create a file with an mtime FS entry
-	firstFS := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("%v?insens=true&timeprecisionsecond=true", t.Name()), &OptionDetectCaseConflicts{}, NewMtimeOption(mtimeDB))
+	firstFS := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("%v?insens=true&timeprecisionsecond=true", t.Name()), &OptionDetectCaseConflicts{}, NewMtimeOption(mtimeDB, ""))
 
 	// Create a file, set its mtime and check that we get the expected mtime when stat-ing.
 	file, err := firstFS.Create(name)
@@ -231,6 +231,32 @@ func TestRepro9677MissingMtimeFS(t *testing.T) {
 	// be without mtime, even if requested:
 	NewFilesystem(FilesystemTypeFake, fmt.Sprintf("%v?insens=true&timeprecisionsecond=true", t.Name()), &OptionDetectCaseConflicts{})
 
-	newFS := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("%v?insens=true&timeprecisionsecond=true", t.Name()), &OptionDetectCaseConflicts{}, NewMtimeOption(mtimeDB))
+	newFS := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("%v?insens=true&timeprecisionsecond=true", t.Name()), &OptionDetectCaseConflicts{}, NewMtimeOption(mtimeDB, ""))
 	checkMtime(newFS)
+}
+
+func TestBasicFilesystemRoots(t *testing.T) {
+	var bfs BasicFilesystem
+	roots, err := bfs.Roots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The expected results depends on the system and we can't say too much,
+	// but do some sanity checking.
+	t.Logf("%d roots: %+v", len(roots), roots)
+	if len(roots) > 25 {
+		t.Errorf("suspiciously large number of filesystem roots: %d", len(roots))
+	}
+	rm := make(map[string]struct{})
+	for _, root := range roots {
+		if root == "" {
+			t.Error("empty root")
+			continue
+		}
+		if _, ok := rm[root]; ok {
+			t.Errorf("duplicate root %q", root)
+			continue
+		}
+		rm[root] = struct{}{}
+	}
 }

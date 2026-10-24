@@ -13,14 +13,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/netutil"
@@ -31,7 +33,7 @@ import (
 
 const (
 	OldestHandledVersion = 10
-	CurrentVersion       = 37
+	CurrentVersion       = 52
 	MaxRescanIntervalS   = 365 * 24 * 60 * 60
 )
 
@@ -49,7 +51,6 @@ var (
 		"dynamic+https://relays.syncthing.net/endpoint",
 		netutil.AddressURL("quic", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultQUICPort))),
 	}
-	DefaultGUIPort = 8384
 	// DefaultDiscoveryServersV4 should be substituted when the configuration
 	// contains <globalAnnounceServer>default-v4</globalAnnounceServer>.
 	DefaultDiscoveryServersV4 = []string{
@@ -69,26 +70,18 @@ var (
 	DefaultTheme = "default"
 	// Default stun servers should be substituted when the configuration
 	// contains <stunServer>default</stunServer>.
-
-	// DefaultPrimaryStunServers are servers provided by us (to avoid causing the public servers burden)
-	DefaultPrimaryStunServers = []string{
-		"stun.syncthing.net:3478",
-	}
-	DefaultSecondaryStunServers = []string{
-		"stun.callwithus.com:3478",
+	// The primary stun servers are provided by us and are resolved via an SRV record
+	// The fallback stun servers are used if the primary ones can't be resolved or are down.
+	DefaultFallbackStunServers = []string{
 		"stun.counterpath.com:3478",
-		"stun.counterpath.net:3478",
-		"stun.ekiga.net:3478",
-		"stun.ideasip.com:3478",
+		"stun.hitv.com:3478",
 		"stun.internetcalls.com:3478",
+		"stun.miwifi.com:3478",
 		"stun.schlund.de:3478",
-		"stun.sipgate.net:10000",
 		"stun.sipgate.net:3478",
 		"stun.voip.aebc.com:3478",
-		"stun.voiparound.com:3478",
 		"stun.voipbuster.com:3478",
 		"stun.voipstunt.com:3478",
-		"stun.xten.com:3478",
 	}
 )
 
@@ -98,37 +91,72 @@ var (
 	errFolderPathEmpty   = errors.New("folder has empty path")
 )
 
+type Configuration struct {
+	Version                  int                   `json:"version" xml:"version,attr"`
+	Folders                  []FolderConfiguration `json:"folders" xml:"folder"`
+	Devices                  []DeviceConfiguration `json:"devices" xml:"device"`
+	GUI                      GUIConfiguration      `json:"gui" xml:"gui"`
+	LDAP                     LDAPConfiguration     `json:"ldap" xml:"ldap"`
+	Options                  OptionsConfiguration  `json:"options" xml:"options"`
+	IgnoredDevices           []ObservedDevice      `json:"remoteIgnoredDevices" xml:"remoteIgnoredDevice"`
+	DeprecatedPendingDevices []ObservedDevice      `json:"-" xml:"pendingDevice,omitempty"` // Deprecated: Do not use.
+	Defaults                 Defaults              `json:"defaults" xml:"defaults"`
+}
+
+type Defaults struct {
+	Folder  FolderConfiguration `json:"folder" xml:"folder"`
+	Device  DeviceConfiguration `json:"device" xml:"device"`
+	Ignores Ignores             `json:"ignores" xml:"ignores"`
+}
+
+type Ignores struct {
+	Lines []string `json:"lines" xml:"line"`
+}
+
 func New(myID protocol.DeviceID) Configuration {
 	var cfg Configuration
 	cfg.Version = CurrentVersion
 
 	if build.IsIOS {
 		cfg.Options.URSeen = 999999 // maxint so we never send usage reports on iOS
-		cfg.Options.DeprecatedDefaultFolderPath = "."
 		// FIXME Find better solution than blank user and password, but suppress this notification for now
 	} else {
 		cfg.Options.UnackedNotificationIDs = []string{"authenticationUserAndPassword"}
 	}
 
 	structutil.SetDefaults(&cfg)
+	if build.IsIOS {
+		cfg.Defaults.Folder.Path = ""
+		cfg.Defaults.Folder.RescanIntervalS = 60
+		cfg.Defaults.Folder.FSWatcherEnabled = false
+	}
 
 	// Can't happen.
 	if err := cfg.prepare(myID); err != nil {
-		l.Warnln("bug: error in preparing new folder:", err)
-		panic("error in preparing new folder")
+		panic("bug: error in preparing new folder")
 	}
 
 	return cfg
 }
 
 func (cfg *Configuration) ProbeFreePorts() error {
-	port, err := getFreePort("127.0.0.1", DefaultGUIPort)
-	if err != nil {
-		return fmt.Errorf("get free port (GUI): %w", err)
+	if cfg.GUI.Network() == "tcp" {
+		guiHost, guiPort, err := net.SplitHostPort(cfg.GUI.Address())
+		if err != nil {
+			return fmt.Errorf("get default port (GUI): %w", err)
+		}
+		port, err := strconv.Atoi(guiPort)
+		if err != nil {
+			return fmt.Errorf("convert default port (GUI): %w", err)
+		}
+		port, err = getFreePort(guiHost, port)
+		if err != nil {
+			return fmt.Errorf("get free port (GUI): %w", err)
+		}
+		cfg.GUI.RawAddress = net.JoinHostPort(guiHost, strconv.Itoa(port))
 	}
-	cfg.GUI.RawAddress = fmt.Sprintf("127.0.0.1:%d", port)
 
-	port, err = getFreePort("0.0.0.0", DefaultTCPPort)
+	port, err := getFreePort("0.0.0.0", DefaultTCPPort)
 	if err != nil {
 		return fmt.Errorf("get free port (BEP): %w", err)
 	}
@@ -147,6 +175,7 @@ func (cfg *Configuration) ProbeFreePorts() error {
 
 type xmlConfiguration struct {
 	Configuration
+
 	XMLName xml.Name `xml:"configuration"`
 }
 
@@ -214,6 +243,10 @@ func ReadJSON(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
 
 func (cfg Configuration) Copy() Configuration {
 	newCfg := cfg
+
+	// Deep copy Defaults
+	newCfg.Defaults.Folder = cfg.Defaults.Folder.Copy()
+	newCfg.Defaults.Device = cfg.Defaults.Device.Copy()
 
 	// Deep copy FolderConfigurations
 	newCfg.Folders = make([]FolderConfiguration, len(cfg.Folders))
@@ -311,10 +344,10 @@ func (cfg *Configuration) prepareDeviceList() map[protocol.DeviceID]*DeviceConfi
 	// - free from duplicates
 	// - no devices with empty ID
 	// - sorted by ID
-	// Happen before preparting folders as that needs a correct device list.
+	// Happen before preparing folders as that needs a correct device list.
 	cfg.Devices = ensureNoDuplicateOrEmptyIDDevices(cfg.Devices)
-	sort.Slice(cfg.Devices, func(a, b int) bool {
-		return cfg.Devices[a].DeviceID.Compare(cfg.Devices[b].DeviceID) == -1
+	slices.SortFunc(cfg.Devices, func(a, b DeviceConfiguration) int {
+		return a.DeviceID.Compare(b.DeviceID)
 	})
 
 	// Build a list of available devices
@@ -356,8 +389,8 @@ func (cfg *Configuration) prepareFolders(myID protocol.DeviceID, existingDevices
 		}
 	}
 	// Ensure that the folder list is sorted by ID
-	sort.Slice(cfg.Folders, func(a, b int) bool {
-		return cfg.Folders[a].ID < cfg.Folders[b].ID
+	slices.SortFunc(cfg.Folders, func(a, b FolderConfiguration) int {
+		return strings.Compare(a.ID, b.ID)
 	})
 	return sharedFolders, nil
 }
@@ -397,7 +430,7 @@ func (cfg *Configuration) removeDeprecatedProtocols() {
 
 func (cfg *Configuration) applyMigrations() {
 	if cfg.Version > 0 && cfg.Version < OldestHandledVersion {
-		l.Warnf("Configuration version %d is deprecated. Attempting best effort conversion, but please verify manually.", cfg.Version)
+		slog.Warn("Loaded deprecated configuration version; attempting best effort conversion, but please verify manually", "version", cfg.Version)
 	}
 
 	// Upgrade configuration versions as appropriate
@@ -570,7 +603,7 @@ func ensureNoUntrustedTrustingSharing(f *FolderConfiguration, devices []FolderDe
 			continue
 		}
 		if devCfg := existingDevices[dev.DeviceID]; devCfg.Untrusted {
-			l.Warnf("Folder %s (%s) is shared in trusted mode with untrusted device %s (%s); unsharing.", f.ID, f.Label, dev.DeviceID.Short(), devCfg.Name)
+			slog.Error("Folder is shared in trusted mode with untrusted device; unsharing", dev.DeviceID.LogAttr(), f.LogAttr())
 			devices = sliceutil.RemoveAndZero(devices, i)
 			i--
 		}
@@ -590,7 +623,7 @@ func cleanSymlinks(filesystem fs.Filesystem, dir string) {
 			return err
 		}
 		if info.IsSymlink() {
-			l.Infoln("Removing incorrectly versioned symlink", path)
+			slog.Warn("Removing incorrectly versioned symlink", slogutil.FilePath(path))
 			filesystem.Remove(path)
 			return fs.SkipDir
 		}
@@ -641,7 +674,7 @@ func (defaults *Defaults) prepare(myID protocol.DeviceID, existingDevices map[pr
 	defaults.Device.prepare(nil)
 }
 
-func ensureZeroForNodefault(empty interface{}, target interface{}) {
+func ensureZeroForNodefault(empty any, target any) {
 	copyMatchingTag(empty, target, "nodefault", func(v string) bool {
 		if len(v) > 0 && v != "true" {
 			panic(fmt.Sprintf(`unexpected tag value: %s. expected untagged or "true"`, v))
@@ -651,7 +684,7 @@ func ensureZeroForNodefault(empty interface{}, target interface{}) {
 }
 
 // copyMatchingTag copies fields tagged tag:"value" from "from" struct onto "to" struct.
-func copyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy func(value string) bool) {
+func copyMatchingTag(from any, to any, tag string, shouldCopy func(value string) bool) {
 	fromStruct := reflect.ValueOf(from).Elem()
 	fromType := fromStruct.Type()
 
@@ -662,7 +695,7 @@ func copyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy fu
 		panic(fmt.Sprintf("non equal types: %s != %s", fromType, toType))
 	}
 
-	for i := 0; i < toStruct.NumField(); i++ {
+	for i := range toStruct.NumField() {
 		fromField := fromStruct.Field(i)
 		toField := toStruct.Field(i)
 

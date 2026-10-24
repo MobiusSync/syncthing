@@ -7,10 +7,12 @@
 package model
 
 import (
+	"log/slog"
+	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/events"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 type folderState int
@@ -25,12 +27,15 @@ const (
 	FolderCleaning
 	FolderCleanWaiting
 	FolderError
+	FolderStarting
 )
 
 func (s folderState) String() string {
 	switch s {
 	case FolderIdle:
 		return "idle"
+	case FolderStarting:
+		return "starting"
 	case FolderScanning:
 		return "scanning"
 	case FolderScanWaiting:
@@ -94,7 +99,6 @@ func newStateTracker(id string, evLogger events.Logger) stateTracker {
 	return stateTracker{
 		folderID: id,
 		evLogger: evLogger,
-		mut:      sync.NewMutex(),
 	}
 }
 
@@ -115,13 +119,7 @@ func (s *stateTracker) setState(newState folderState) {
 		metricFolderState.WithLabelValues(s.folderID).Set(float64(s.current))
 	}()
 
-	/* This should hold later...
-	if s.current != FolderIdle && (newState == FolderScanning || newState == FolderSyncing) {
-		panic("illegal state transition " + s.current.String() + " -> " + newState.String())
-	}
-	*/
-
-	eventData := map[string]interface{}{
+	eventData := map[string]any{
 		"folder": s.folderID,
 		"to":     newState.String(),
 		"from":   s.current.String(),
@@ -130,6 +128,8 @@ func (s *stateTracker) setState(newState folderState) {
 	if !s.changed.IsZero() {
 		eventData["duration"] = time.Since(s.changed).Seconds()
 	}
+
+	slog.Debug("Folder changed state", "folder", s.folderID, "state", newState, "from", s.current)
 
 	s.current = newState
 	s.changed = time.Now().Truncate(time.Second)
@@ -156,9 +156,15 @@ func (s *stateTracker) setError(err error) {
 		metricFolderState.WithLabelValues(s.folderID).Set(float64(s.current))
 	}()
 
-	eventData := map[string]interface{}{
+	eventData := map[string]any{
 		"folder": s.folderID,
 		"from":   s.current.String(),
+	}
+
+	if err != nil && s.current != FolderError {
+		slog.Warn("Folder is in error state", slog.String("folder", s.folderID), slogutil.Error(err))
+	} else if err == nil && s.current == FolderError {
+		slog.Info("Folder error state was cleared", slog.String("folder", s.folderID))
 	}
 
 	if err != nil {

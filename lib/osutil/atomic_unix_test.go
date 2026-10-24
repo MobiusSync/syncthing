@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build !windows
-// +build !windows
 
 // (No syscall.Umask or the equivalent on Windows)
 
@@ -38,7 +37,7 @@ func TestTempFilePermissions(t *testing.T) {
 	// The temp file should have 0600 permissions at the most, or we have a
 	// security problem in CreateAtomic.
 	t.Logf("Got 0%03o", info.Mode())
-	if info.Mode()&^0600 != 0 {
+	if info.Mode()&^0o600 != 0 {
 		t.Errorf("Permission 0%03o is too generous", info.Mode())
 	}
 }

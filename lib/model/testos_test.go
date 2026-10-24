@@ -6,13 +6,9 @@
 
 package model
 
-import (
-	"github.com/syncthing/syncthing/lib/fs"
-)
-
 // fatal is the required common interface between *testing.B and *testing.T
 type fatal interface {
-	Fatal(...interface{})
+	Fatal(...any)
 	Helper()
 }
 
@@ -23,9 +19,9 @@ func must(f fatal, err error) {
 	}
 }
 
-func mustRemove(f fatal, err error) {
-	f.Helper()
-	if err != nil && !fs.IsNotExist(err) {
-		f.Fatal(err)
+func mustV[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
 	}
+	return v
 }

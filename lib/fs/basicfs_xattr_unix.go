@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build !windows && !dragonfly && !illumos && !solaris && !openbsd
-// +build !windows,!dragonfly,!illumos,!solaris,!openbsd
 
 package fs
 
@@ -69,7 +68,7 @@ var xattrBufPool = sync.Pool{
 }
 
 func getXattr(path, name string) ([]byte, error) {
-	buf := xattrBufPool.Get().([]byte)
+	buf := xattrBufPool.Get().([]byte) //nolint:forcetypeassert
 	defer func() {
 		// Put the buffer back in the pool, or not if we're not supposed to
 		// (we returned it to the caller).

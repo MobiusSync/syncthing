@@ -44,7 +44,7 @@ func CreateAtomic(path string) (*AtomicWriter, error) {
 func CreateAtomicFilesystem(filesystem fs.Filesystem, path string) (*AtomicWriter, error) {
 	// The security of this depends on the tempfile having secure
 	// permissions, 0600, from the beginning. This is what os.CreateTemp
-	// does. We have a test that verifies that that is the case, should this
+	// does. We have a test that verifies that this is the case, should this
 	// ever change in the standard library in the future.
 	fd, err := TempFile(filesystem, filepath.Dir(path), TempPrefix)
 	if err != nil {
@@ -101,7 +101,7 @@ func (w *AtomicWriter) Close() error {
 		// On Windows, we might not be allowed to rename over the file
 		// because it's read-only. Get us some write permissions and try
 		// again.
-		_ = w.fs.Chmod(w.path, 0644)
+		_ = w.fs.Chmod(w.path, 0o644)
 		err = w.fs.Rename(w.next.Name(), w.path)
 	}
 	if err != nil {

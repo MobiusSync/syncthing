@@ -10,12 +10,16 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gobwas/glob"
 	"golang.org/x/text/unicode/norm"
@@ -24,8 +28,18 @@ import (
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore/ignoreresult"
 	"github.com/syncthing/syncthing/lib/osutil"
-	"github.com/syncthing/syncthing/lib/sync"
 )
+
+const escapePrefix = "#escape"
+
+var defaultEscapeChar = '\\'
+
+func init() {
+	if os.PathSeparator == defaultEscapeChar {
+		// The pipe character (|) is not allowed in filenames on Windows
+		defaultEscapeChar = '|'
+	}
+}
 
 // A ParseError signifies an error with contents of an ignore file,
 // including I/O errors on included files. An I/O error on the root level
@@ -78,7 +92,7 @@ func (p Pattern) allowsSkippingIgnoredDirs() bool {
 	if p.result.IsIgnored() {
 		return true
 	}
-	if p.pattern[0] != '/' {
+	if p.pattern == "" || p.pattern[0] != '/' {
 		return false
 	}
 	// A "/**" at the end is allowed and doesn't have any bearing on the
@@ -110,23 +124,13 @@ type Matcher struct {
 	fs             fs.Filesystem
 	lines          []string  // exact lines read from .stignore
 	patterns       []Pattern // patterns including those from included files
-	withCache      bool
-	matches        *cache
 	curHash        string
-	stop           chan struct{}
 	changeDetector ChangeDetector
 	mut            sync.Mutex
 }
 
 // An Option can be passed to New()
 type Option func(*Matcher)
-
-// WithCache enables or disables lookup caching. The default is disabled.
-func WithCache(v bool) Option {
-	return func(m *Matcher) {
-		m.withCache = v
-	}
-}
 
 // WithChangeDetector sets a custom ChangeDetector. The default is to simply
 // use the on disk modtime for comparison.
@@ -138,18 +142,13 @@ func WithChangeDetector(cd ChangeDetector) Option {
 
 func New(fs fs.Filesystem, opts ...Option) *Matcher {
 	m := &Matcher{
-		fs:   fs,
-		stop: make(chan struct{}),
-		mut:  sync.NewMutex(),
+		fs: fs,
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
 	if m.changeDetector == nil {
 		m.changeDetector = newModtimeChecker()
-	}
-	if m.withCache {
-		go m.clean(2 * time.Hour)
 	}
 	return m
 }
@@ -206,9 +205,6 @@ func (m *Matcher) parseLocked(r io.Reader, file string) error {
 
 	m.curHash = newHash
 	m.patterns = patterns
-	if m.withCache {
-		m.matches = newCache()
-	}
 
 	return err
 }
@@ -219,7 +215,7 @@ func (m *Matcher) parseLocked(r io.Reader, file string) error {
 // NFC everywhere else). This is always the case in real usage in syncthing, as
 // we ensure native unicode normalisation on all entry points (scanning and from
 // protocol) - so no need to normalize when calling this, except e.g. in tests.
-func (m *Matcher) Match(file string) (result ignoreresult.R) {
+func (m *Matcher) Match(file string) ignoreresult.R {
 	switch {
 	case fs.IsTemporary(file):
 		return ignoreresult.IgnoreAndSkip
@@ -238,20 +234,8 @@ func (m *Matcher) Match(file string) (result ignoreresult.R) {
 		return ignoreresult.NotIgnored
 	}
 
+	// Change backslashes to slashes (on Windows only)
 	file = filepath.ToSlash(file)
-
-	if m.matches != nil {
-		// Check the cache for a known result.
-		res, ok := m.matches.get(file)
-		if ok {
-			return res
-		}
-
-		// Update the cache with the result at return time
-		defer func() {
-			m.matches.set(file, result)
-		}()
-	}
 
 	// Check all the patterns for a match. Track whether the patterns so far
 	// allow skipping matched directories or not. As soon as we hit an
@@ -313,38 +297,17 @@ func (m *Matcher) Hash() string {
 	return m.curHash
 }
 
-func (m *Matcher) Stop() {
-	close(m.stop)
-}
-
-func (m *Matcher) clean(d time.Duration) {
-	t := time.NewTimer(d / 2)
-	for {
-		select {
-		case <-m.stop:
-			return
-		case <-t.C:
-			m.mut.Lock()
-			if m.matches != nil {
-				m.matches.clean(d)
-			}
-			t.Reset(d / 2)
-			m.mut.Unlock()
-		}
-	}
-}
-
 func hashPatterns(patterns []Pattern) string {
 	h := sha256.New()
 	for _, pat := range patterns {
 		h.Write([]byte(pat.String()))
 		h.Write([]byte("\n"))
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func loadIgnoreFile(fs fs.Filesystem, file string) (fs.File, fs.FileInfo, error) {
-	fd, err := fs.Open(file)
+func loadIgnoreFile(ffs fs.Filesystem, file string) (fs.File, fs.FileInfo, error) {
+	fd, err := ffs.OpenFile(file, fs.OptReadOnly|fs.OptFollow, 0o666)
 	if err != nil {
 		return fd, nil, err
 	}
@@ -449,6 +412,10 @@ func parseLine(line string) ([]Pattern, error) {
 		patterns[0] = pattern
 
 		line = line[3:]
+		if line == "" {
+			// Pattern was exactly "**/", already covered by patterns[0].
+			return patterns[:1], nil
+		}
 		pattern.pattern = line
 		pattern.match, err = glob.Compile(line, '/')
 		if err != nil {
@@ -504,8 +471,36 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 		return nil, nil, err
 	}
 
+	escapeChar := defaultEscapeChar
+
 	var err error
+	escapePrefixSeen := false
+	includedPatterns := 0
 	for _, line := range lines {
+		if strings.HasPrefix(line, escapePrefix) {
+			if escapePrefixSeen {
+				return nil, nil, errors.New("mutiple #escape= lines found in ignore file")
+			}
+
+			if len(patterns)-includedPatterns > 0 {
+				return nil, nil, errors.New("#escape= line found after patterns in ignore file")
+			}
+
+			escapePrefixSeen = true
+			trimmed := strings.TrimSpace(strings.TrimPrefix(line, escapePrefix))
+			before, esc, ok := strings.Cut(trimmed, "=")
+			if ok && before == "" {
+				esc = strings.TrimSpace(esc)
+				// avoids allocation of a new slice.
+				if utf8.RuneCountInString(esc) == 1 {
+					escapeChar, _ = utf8.DecodeRuneInString(esc)
+					continue
+				}
+			}
+
+			return nil, nil, fmt.Errorf("failed to parse #escape= line in ignore file: %q", line)
+		}
+
 		if _, ok := linesSeen[line]; ok {
 			continue
 		}
@@ -517,7 +512,18 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 			continue
 		}
 
-		line = filepath.ToSlash(line)
+		if escapeChar != '\\' {
+			// ToSlash changes backslashes to forward slashes on Windows only,
+			// so we only need to do this, if escapeChar is not a backslash.
+			// If escapeChar is a backslash, then the user is using forward
+			// slashes for path separators, and we leave backslashes alone.
+			line = filepath.ToSlash(line)
+			// Replace all escapeChars with backslashes
+			line = strings.ReplaceAll(line, string(escapeChar), `\`)
+			// Now restore double escapeChars to actually escape the escapeChar.
+			line = strings.ReplaceAll(line, `\\`, `\`+string(escapeChar))
+		}
+
 		switch {
 		case strings.HasPrefix(line, "#include"):
 			fields := strings.SplitN(line, " ", 2)
@@ -536,6 +542,7 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 			var includePatterns []Pattern
 			if includePatterns, err = loadParseIncludeFile(fs, includeFile, cd, linesSeen); err == nil {
 				patterns = append(patterns, includePatterns...)
+				includedPatterns += len(includePatterns)
 			} else {
 				// Wrap the error, as if the include does not exist, we get a
 				// IsNotExists(err) == true error, which we use to check

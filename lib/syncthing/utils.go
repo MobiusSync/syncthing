@@ -7,14 +7,23 @@
 package syncthing
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"sync"
+	"time"
 
+	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/internal/db/olddb"
+	"github.com/syncthing/syncthing/internal/db/olddb/backend"
+	"github.com/syncthing/syncthing/internal/db/sqlite"
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/locations"
@@ -33,12 +42,12 @@ func EnsureDir(dir string, mode fs.FileMode) error {
 		// Apparently the stat may fail even though the mkdirall passed. If it
 		// does, we'll just assume things are in order and let other things
 		// fail (like loading or creating the config...).
-		currentMode := fi.Mode() & 0777
+		currentMode := fi.Mode() & 0o777
 		if currentMode != mode {
 			err := fs.Chmod(".", mode)
 			// This can fail on crappy filesystems, nothing we can do about it.
 			if err != nil {
-				l.Warnln(err)
+				slog.Warn("Failed to correct directory permissions", slogutil.Error(err))
 			}
 		}
 	}
@@ -54,43 +63,33 @@ func LoadOrGenerateCertificate(certFile, keyFile string) (tls.Certificate, error
 }
 
 func GenerateCertificate(certFile, keyFile string) (tls.Certificate, error) {
-	l.Infof("Generating ECDSA key and certificate for %s...", tlsDefaultCommonName)
-	return tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, deviceCertLifetimeDays)
+	slog.Info("Generating key and certificate", "cn", tlsDefaultCommonName)
+	return tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, deviceCertLifetimeDays, false)
 }
 
-func DefaultConfig(path string, myID protocol.DeviceID, evLogger events.Logger, noDefaultFolder, skipPortProbing bool) (config.Wrapper, error) {
+func DefaultConfig(path string, myID protocol.DeviceID, evLogger events.Logger, skipPortProbing bool) (config.Wrapper, error) {
 	newCfg := config.New(myID)
 
 	if skipPortProbing {
-		l.Infoln("Using default network port numbers instead of probing for free ports")
+		slog.Info("Using default network port numbers instead of probing for free ports")
+		// Record address override initially
+		newCfg.GUI.RawAddress = newCfg.GUI.Address()
 	} else if err := newCfg.ProbeFreePorts(); err != nil {
 		return nil, err
 	}
 
-	if noDefaultFolder {
-		l.Infoln("We will skip creation of a default folder on first start")
-		return config.Wrap(path, newCfg, myID, evLogger), nil
-	}
-
-	fcfg := newCfg.Defaults.Folder.Copy()
-	fcfg.ID = "default"
-	fcfg.Label = "Default Folder"
-	fcfg.FilesystemType = fs.FilesystemTypeBasic
-	fcfg.Path = locations.GetRelative(locations.DefFolder)
-	newCfg.Folders = append(newCfg.Folders, fcfg)
-	l.Infoln("Default folder created and/or linked to new config")
 	return config.Wrap(path, newCfg, myID, evLogger), nil
 }
 
 // LoadConfigAtStartup loads an existing config. If it doesn't yet exist, it
-// creates a default one, without the default folder if noDefaultFolder is true.
-// Otherwise it checks the version, and archives and upgrades the config if
-// necessary or returns an error, if the version isn't compatible.
-func LoadConfigAtStartup(path string, cert tls.Certificate, evLogger events.Logger, allowNewerConfig, noDefaultFolder, skipPortProbing bool) (config.Wrapper, error) {
+// creates a default one. Otherwise it checks the version, and archives and
+// upgrades the config if necessary or returns an error, if the version
+// isn't compatible.
+func LoadConfigAtStartup(path string, cert tls.Certificate, evLogger events.Logger, allowNewerConfig, skipPortProbing bool) (config.Wrapper, error) {
 	myID := protocol.NewDeviceID(cert.Certificate[0])
 	cfg, originalVersion, err := config.Load(path, myID, evLogger)
 	if fs.IsNotExist(err) {
-		cfg, err = DefaultConfig(path, myID, evLogger, noDefaultFolder, skipPortProbing)
+		cfg, err = DefaultConfig(path, myID, evLogger, skipPortProbing)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate default config: %w", err)
 		}
@@ -98,19 +97,16 @@ func LoadConfigAtStartup(path string, cert tls.Certificate, evLogger events.Logg
 		if err != nil {
 			return nil, fmt.Errorf("failed to save default config: %w", err)
 		}
-		l.Infof("Default config saved. Edit %s to taste (with Syncthing stopped) or use the GUI", cfg.ConfigPath())
-	} else if err == io.EOF {
+		slog.Info("Default config saved; edit to taste (with Syncthing stopped) or use the GUI", slogutil.FilePath(cfg.ConfigPath()))
+	} else if errors.Is(err, io.EOF) {
 		return nil, errors.New("failed to load config: unexpected end of file. Truncated or empty configuration?")
 	} else if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
 	if originalVersion != config.CurrentVersion {
-		if originalVersion == config.CurrentVersion+1101 {
-			l.Infof("Now, THAT's what we call a config from the future! Don't worry. As long as you hit that wire with the connecting hook at precisely eighty-eight miles per hour the instant the lightning strikes the tower... everything will be fine.")
-		}
 		if originalVersion > config.CurrentVersion && !allowNewerConfig {
-			return nil, fmt.Errorf("config file version (%d) is newer than supported version (%d). If this is expected, use --allow-newer-config to override.", originalVersion, config.CurrentVersion)
+			return nil, fmt.Errorf("config file version (%d) is newer than supported version (%d); if this is expected, use --allow-newer-config to override", originalVersion, config.CurrentVersion)
 		}
 		err = archiveAndSaveConfig(cfg, originalVersion)
 		if err != nil {
@@ -124,7 +120,7 @@ func LoadConfigAtStartup(path string, cert tls.Certificate, evLogger events.Logg
 func archiveAndSaveConfig(cfg config.Wrapper, originalVersion int) error {
 	// Copy the existing config to an archive copy
 	archivePath := cfg.ConfigPath() + fmt.Sprintf(".v%d", originalVersion)
-	l.Infoln("Archiving a copy of old config file format at:", archivePath)
+	slog.Info("Archiving a copy of old config file format", slogutil.FilePath(archivePath))
 	if err := copyFile(cfg.ConfigPath(), archivePath); err != nil {
 		return err
 	}
@@ -139,7 +135,7 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	if err := os.WriteFile(dst, bs, 0600); err != nil {
+	if err := os.WriteFile(dst, bs, 0o600); err != nil {
 		// Attempt to clean up
 		os.Remove(dst)
 		return err
@@ -148,6 +144,240 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-func OpenDBBackend(path string, tuning config.Tuning) (backend.Backend, error) {
-	return backend.Open(path, backend.Tuning(tuning))
+// Opens a database
+func OpenDatabase(path string, deleteRetention time.Duration) (db.DB, error) {
+	sql, err := sqlite.Open(path, sqlite.WithDeleteRetention(deleteRetention))
+	if err != nil {
+		return nil, err
+	}
+
+	sdb := db.MetricsWrap(sql)
+
+	return sdb, nil
+}
+
+// ErrLegacyDatabase identifies failures reading the source database during an
+// upgrade. The wrapped cause remains available for storage-error classification.
+var ErrLegacyDatabase = errors.New("cannot read legacy database")
+
+// Attempts migration of the old (LevelDB-based) database type to the new (SQLite-based) type
+func TryMigrateDatabase(ctx context.Context, deleteRetention time.Duration) error {
+	return tryMigrateDatabase(ctx, deleteRetention, func(path string, bulk bool) (db.DB, error) {
+		if bulk {
+			return sqlite.OpenForMigration(path)
+		}
+		return sqlite.Open(path, sqlite.WithDeleteRetention(deleteRetention))
+	})
+}
+
+// The opener keeps fault injection local to a migration attempt; production uses
+// the existing SQLite bulk importer and normal database opener above.
+func tryMigrateDatabase(ctx context.Context, deleteRetention time.Duration, open func(string, bool) (db.DB, error)) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	oldDBDir := locations.Get(locations.LegacyDatabase)
+	if _, err := os.Lstat(oldDBDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: stat: %w", ErrLegacyDatabase, err)
+	}
+
+	be, err := backend.OpenLevelDBRO(oldDBDir)
+	if err != nil {
+		return fmt.Errorf("%w: open: %w", ErrLegacyDatabase, err)
+	}
+	defer func() {
+		if be != nil {
+			retErr = errors.Join(retErr, be.Close())
+		}
+	}()
+
+	sdb, err := open(locations.Get(locations.Database), true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if sdb != nil {
+			retErr = errors.Join(retErr, sdb.Close())
+		}
+	}()
+
+	miscDB := db.NewMiscDB(sdb)
+	when, ok, err := miscDB.Time("migrated-from-leveldb-at")
+	if err != nil {
+		return fmt.Errorf("read migration marker: %w", err)
+	}
+	if ok {
+		slog.Error("Old-style database present but already migrated; please manually move or remove.", slog.Any("migratedAt", when), slogutil.FilePath(oldDBDir))
+		return nil
+	}
+
+	slog.Info("Migrating old-style database to SQLite; this may take a while...")
+	t0 := time.Now()
+
+	ll, err := olddb.NewLowlevel(be)
+	if err != nil {
+		return err
+	}
+
+	totFiles, totBlocks := 0, 0
+	for _, folder := range ll.ListFolders() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Acquire the source snapshot before starting the writer, so a snapshot
+		// failure cannot leave a writer waiting on an unclosed channel.
+		fs, err := olddb.NewFileSet(folder, ll)
+		if err != nil {
+			return err
+		}
+		snap, err := fs.Snapshot()
+		if err != nil {
+			return fmt.Errorf("%w: snapshot folder %q: %w", ErrLegacyDatabase, folder, err)
+		}
+
+		// Start a writer routine
+		fis := make(chan protocol.FileInfo, 50)
+		var writeErr error
+		var wg sync.WaitGroup
+		writerDone := make(chan struct{})
+		wg.Go(func() { //nolint:contextcheck
+			defer close(writerDone)
+			var batch []protocol.FileInfo
+			files, blocks := 0, 0
+			t0 := time.Now()
+			t1 := time.Now()
+
+			if writeErr = sdb.DropFolder(folder); writeErr != nil {
+				slog.Error("Failed database drop", slogutil.Error(writeErr))
+				return
+			}
+
+			for fi := range fis {
+				if writeErr = ctx.Err(); writeErr != nil {
+					return
+				}
+				batch = append(batch, fi)
+				files++
+				blocks += len(fi.Blocks)
+				if len(batch) == 1000 {
+					writeErr = sdb.Update(folder, protocol.LocalDeviceID, batch)
+					if writeErr != nil {
+						slog.Error("Failed database write", slogutil.Error(writeErr))
+						return
+					}
+					batch = batch[:0]
+					if time.Since(t1) > 10*time.Second {
+						d := time.Since(t0) + 1
+						t1 = time.Now()
+						slog.Info("Still migrating folder", "folder", folder, "files", files, "blocks", blocks, "duration", d.Truncate(time.Second), "blocksrate", float64(blocks)/d.Seconds(), "filesrate", float64(files)/d.Seconds())
+					}
+				}
+			}
+			if writeErr = ctx.Err(); writeErr != nil {
+				return
+			}
+			if len(batch) > 0 {
+				if writeErr = sdb.Update(folder, protocol.LocalDeviceID, batch); writeErr != nil {
+					return
+				}
+			}
+			d := time.Since(t0) + 1
+			slog.Info("Migrated folder", "folder", folder, "files", files, "blocks", blocks, "duration", d.Truncate(time.Second), "filesrate", float64(files)/d.Seconds())
+			totFiles += files
+			totBlocks += blocks
+		})
+
+		// Iterate the existing files
+		iterErr := snap.WithHaveSequence(0, func(fi protocol.FileInfo) bool {
+			if deleteRetention > 0 && fi.Deleted && time.Since(fi.ModTime()) > deleteRetention {
+				// Skip deleted files that match the garbage collection
+				// criteria in the database
+				return true
+			}
+			select {
+			case fis <- fi:
+				return true
+			case <-writerDone:
+				return false
+			case <-ctx.Done():
+				return false
+			}
+		})
+		close(fis)
+		snap.Release()
+
+		// Wait for writes to complete
+		wg.Wait()
+		if writeErr != nil {
+			return writeErr
+		}
+		if iterErr != nil {
+			return fmt.Errorf("%w: folder %q: %w", ErrLegacyDatabase, folder, iterErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	slog.Info("Migrating virtual mtimes...")
+	if err := ll.IterateMtimes(func(folder, name string, ondisk, virtual time.Time) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return sdb.PutMtime(folder, name, ondisk, virtual)
+	}); err != nil {
+		return fmt.Errorf("migrate mtimes: %w", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Bulk mode disables journaling and synchronous writes. Close every folder
+	// successfully before committing the completion marker using normal SQLite
+	// settings. An incomplete import remains retryable from the read-only source.
+	closeErr := sdb.Close()
+	sdb = nil
+	if closeErr != nil {
+		return fmt.Errorf("close migrated database: %w", closeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sdb, err = open(locations.Get(locations.Database), false)
+	if err != nil {
+		return fmt.Errorf("reopen migrated database: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	miscDB = db.NewMiscDB(sdb)
+	if err := miscDB.PutString("migrated-from-leveldb-by", build.LongVersion); err != nil {
+		return fmt.Errorf("write migration version: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := miscDB.PutTime("migrated-from-leveldb-at", time.Now()); err != nil {
+		return fmt.Errorf("commit migration marker: %w", err)
+	}
+	closeErr = sdb.Close()
+	sdb = nil
+	if closeErr != nil {
+		return fmt.Errorf("close migration marker database: %w", closeErr)
+	}
+
+	closeErr = be.Close()
+	be = nil
+	if closeErr != nil {
+		return fmt.Errorf("close legacy database: %w", closeErr)
+	}
+	if err := os.Rename(oldDBDir, oldDBDir+"-migrated"); err != nil {
+		return fmt.Errorf("retain migrated legacy database: %w", err)
+	}
+
+	slog.Info("Migration complete", "files", totFiles, "blocks", totBlocks/1000, "duration", time.Since(t0).Truncate(time.Second))
+	return nil
 }

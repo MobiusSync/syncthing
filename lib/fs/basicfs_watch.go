@@ -4,12 +4,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//go:build !(solaris && !cgo) && !(darwin && !cgo) && !(darwin && kqueue) && !(android && amd64) && !ios
+//go:build !(solaris && !cgo) && !(darwin && !cgo) && !(darwin && kqueue)
 // +build !solaris cgo
 // +build !darwin cgo
 // +build !darwin !kqueue
-// +build !android !amd64
-// +build !ios
 
 package fs
 
@@ -55,7 +53,7 @@ func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context
 	if err != nil {
 		notify.Stop(backendChan)
 		if reachedMaxUserWatches(err) {
-			err = errors.New("failed to setup inotify handler. Please increase inotify limits, see https://docs.syncthing.net/users/faq.html#inotify-limits")
+			err = errors.New("failed to set up inotify handler. Please increase inotify limits, see https://docs.syncthing.net/users/faq.html#inotify-limits")
 		}
 		return nil, nil, err
 	}

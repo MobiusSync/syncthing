@@ -7,26 +7,35 @@
 package discover
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"strconv"
 	"time"
 
+	"github.com/thejerf/suture/v4"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/gen/discoproto"
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/beacon"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/svcutil"
-	"github.com/thejerf/suture/v4"
 )
 
 type localClient struct {
 	*suture.Supervisor
+	*cache
+
 	myID     protocol.DeviceID
 	addrList AddressLister
 	name     string
@@ -36,8 +45,6 @@ type localClient struct {
 	localBcastStart time.Time
 	localBcastTick  <-chan time.Time
 	forcedBcastTick chan time.Time
-
-	*cache
 }
 
 const (
@@ -49,7 +56,7 @@ const (
 
 func NewLocal(id protocol.DeviceID, addr string, addrList AddressLister, evLogger events.Logger) (FinderService, error) {
 	c := &localClient{
-		Supervisor:      suture.New("local", svcutil.SpecWithDebugLogger(l)),
+		Supervisor:      suture.New("local", svcutil.SpecWithDebugLogger()),
 		myID:            id,
 		addrList:        addrList,
 		evLogger:        evLogger,
@@ -121,12 +128,12 @@ func (c *localClient) announcementPkt(instanceID int64, msg []byte) ([]byte, boo
 		return msg, false
 	}
 
-	pkt := Announce{
-		ID:         c.myID,
+	pkt := &discoproto.Announce{
+		Id:         c.myID[:],
 		Addresses:  addrs,
-		InstanceID: instanceID,
+		InstanceId: instanceID,
 	}
-	bs, _ := pkt.Marshal()
+	bs, _ := proto.Marshal(pkt)
 
 	if pktLen := 4 + len(bs); cap(msg) < pktLen {
 		msg = make([]byte, 0, pktLen)
@@ -171,7 +178,7 @@ func (c *localClient) recvAnnouncements(ctx context.Context) error {
 			continue
 		}
 		if len(buf) < 4 {
-			l.Debugf("discover: short packet from %s", addr.String())
+			slog.DebugContext(ctx, "received short packet", "address", addr.String())
 			continue
 		}
 
@@ -183,28 +190,29 @@ func (c *localClient) recvAnnouncements(ctx context.Context) error {
 		case v13Magic:
 			// Old version
 			if !warnedAbout[addr.String()] {
-				l.Warnf("Incompatible (v0.13) local discovery packet from %v - upgrade that device to connect", addr)
+				slog.ErrorContext(ctx, "Incompatible (v0.13) local discovery packet - upgrade that device to connect", slogutil.Address(addr))
 				warnedAbout[addr.String()] = true
 			}
 			continue
 
 		default:
-			l.Debugf("discover: Incorrect magic %x from %s", magic, addr)
+			slog.DebugContext(ctx, "Incorrect magic", "magic", magic, "address", addr)
 			continue
 		}
 
-		var pkt Announce
-		err := pkt.Unmarshal(buf[4:])
-		if err != nil && err != io.EOF {
-			l.Debugf("discover: Failed to unmarshal local announcement from %s:\n%s", addr, hex.Dump(buf))
+		var pkt discoproto.Announce
+		err := proto.Unmarshal(buf[4:], &pkt)
+		if err != nil && !errors.Is(err, io.EOF) {
+			slog.DebugContext(ctx, "Failed to unmarshal local announcement", "address", addr, slogutil.Error(err), "packet", hex.Dump(buf[4:]))
 			continue
 		}
 
-		l.Debugf("discover: Received local announcement from %s for %s", addr, pkt.ID)
+		id, _ := protocol.DeviceIDFromBytes(pkt.Id)
+		slog.DebugContext(ctx, "Received local announcement", "address", addr, "device", id)
 
 		var newDevice bool
-		if pkt.ID != c.myID {
-			newDevice = c.registerDevice(addr, pkt)
+		if !bytes.Equal(pkt.Id, c.myID[:]) {
+			newDevice = c.registerDevice(addr, &pkt)
 		}
 
 		if newDevice {
@@ -218,18 +226,24 @@ func (c *localClient) recvAnnouncements(ctx context.Context) error {
 	}
 }
 
-func (c *localClient) registerDevice(src net.Addr, device Announce) bool {
+func (c *localClient) registerDevice(src net.Addr, device *discoproto.Announce) bool {
 	// Remember whether we already had a valid cache entry for this device.
 	// If the instance ID has changed the remote device has restarted since
 	// we last heard from it, so we should treat it as a new device.
 
-	ce, existsAlready := c.Get(device.ID)
-	isNewDevice := !existsAlready || time.Since(ce.when) > CacheLifeTime || ce.instanceID != device.InstanceID
+	id, err := protocol.DeviceIDFromBytes(device.Id)
+	if err != nil {
+		l.Debugf("discover: Failed to parse device ID %x: %v", device.Id, err)
+		return false
+	}
+
+	ce, existsAlready := c.Get(id)
+	isNewDevice := !existsAlready || time.Since(ce.when) > CacheLifeTime || ce.instanceID != device.InstanceId
 
 	// Any empty or unspecified addresses should be set to the source address
 	// of the announcement. We also skip any addresses we can't parse.
 
-	l.Debugln("discover: Registering addresses for", device.ID)
+	l.Debugln("discover: Registering addresses for", id)
 	var validAddresses []string
 	for _, addr := range device.Addresses {
 		u, err := url.Parse(addr)
@@ -272,16 +286,16 @@ func (c *localClient) registerDevice(src net.Addr, device Announce) bool {
 		}
 	}
 
-	c.Set(device.ID, CacheEntry{
+	c.Set(id, CacheEntry{
 		Addresses:  validAddresses,
 		when:       time.Now(),
 		found:      true,
-		instanceID: device.InstanceID,
+		instanceID: device.InstanceId,
 	})
 
 	if isNewDevice {
-		c.evLogger.Log(events.DeviceDiscovered, map[string]interface{}{
-			"device": device.ID.String(),
+		c.evLogger.Log(events.DeviceDiscovered, map[string]any{
+			"device": id.String(),
 			"addrs":  validAddresses,
 		})
 	}

@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build !windows
-// +build !windows
 
 package fs
 
@@ -14,11 +13,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
-func (*BasicFilesystem) SymlinksSupported() bool {
-	return true
-}
+const optNoFollow = syscall.O_NOFOLLOW
 
 func (f *BasicFilesystem) CreateSymlink(target, name string) error {
 	name, err := f.rooted(name)
@@ -34,10 +32,6 @@ func (f *BasicFilesystem) ReadSymlink(name string) (string, error) {
 		return "", err
 	}
 	return os.Readlink(name)
-}
-
-func (*BasicFilesystem) mkdirAll(path string, perm os.FileMode) error {
-	return os.MkdirAll(path, perm)
 }
 
 // Unhide is a noop on unix, as unhiding files requires renaming them.
@@ -86,7 +80,7 @@ func (f *BasicFilesystem) Remove(name string) error {
 // unrooted) or an error if the given path is not a subpath and handles the
 // special case when the given path is the folder root without a trailing
 // pathseparator.
-func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (string, *ErrWatchEventOutsideRoot) {
+func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (string, *WatchEventOutsideRootError) {
 	for _, root := range roots {
 		// Make sure the root ends with precisely one path separator, to
 		// ease prefix comparisons.

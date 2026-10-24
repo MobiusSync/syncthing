@@ -185,6 +185,10 @@ func (*ExtFilesystem) underlying() (Filesystem, bool) {
 	return nil, false
 }
 
-func (*ExtFilesystem) wrapperType() filesystemWrapperType {
-	return filesystemWrapperTypeError
+// ApplyOptions applies the engine's mtime wrapper to an embedded filesystem.
+func ApplyOptions(filesystem Filesystem, opts ...Option) Filesystem {
+	for _, opt := range opts {
+		filesystem = opt.apply(filesystem)
+	}
+	return filesystem
 }

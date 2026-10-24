@@ -7,13 +7,12 @@
 package model_test
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"sync"
 	"testing"
 
-	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/model/mocks"
 	"github.com/syncthing/syncthing/lib/protocol"
 	protomock "github.com/syncthing/syncthing/lib/protocol/mocks"
@@ -23,25 +22,24 @@ import (
 func TestIndexhandlerConcurrency(t *testing.T) {
 	// Verify that sending a lot of index update messages using the
 	// FileInfoBatch works and doesn't trigger the race detector.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 	ci := &protomock.ConnectionInfo{}
 
 	m1 := &mocks.Model{}
-	c1 := protocol.NewConnection(protocol.EmptyDeviceID, ar, bw, testutil.NoopCloser{}, m1, ci, protocol.CompressionNever, nil, nil)
+	c1 := protocol.NewConnection(protocol.EmptyDeviceID, ar, bw, testutil.NoopCloser{}, m1, ci, protocol.CompressionNever, nil)
 	c1.Start()
 	defer c1.Close(io.EOF)
 
 	m2 := &mocks.Model{}
-	c2 := protocol.NewConnection(protocol.EmptyDeviceID, br, aw, testutil.NoopCloser{}, m2, ci, protocol.CompressionNever, nil, nil)
+	c2 := protocol.NewConnection(protocol.EmptyDeviceID, br, aw, testutil.NoopCloser{}, m2, ci, protocol.CompressionNever, nil)
 	c2.Start()
 	defer c2.Close(io.EOF)
 
-	c1.ClusterConfig(&protocol.ClusterConfig{})
-	c2.ClusterConfig(&protocol.ClusterConfig{})
+	c1.ClusterConfig(&protocol.ClusterConfig{}, nil)
+	c2.ClusterConfig(&protocol.ClusterConfig{}, nil)
 	c1.Index(ctx, &protocol.Index{Folder: "foo"})
 	c2.Index(ctx, &protocol.Index{Folder: "foo"})
 
@@ -52,7 +50,7 @@ func TestIndexhandlerConcurrency(t *testing.T) {
 	recvdBatches := 0
 	var wg sync.WaitGroup
 	m2.IndexUpdateCalls(func(_ protocol.Connection, idxUp *protocol.IndexUpdate) error {
-		for j := 0; j < files; j++ {
+		for j := range int(files) {
 			if n := idxUp.Files[j].Name; n != fmt.Sprintf("f%d-%d", recvdBatches, j) {
 				t.Error("wrong filename", n)
 			}
@@ -63,12 +61,12 @@ func TestIndexhandlerConcurrency(t *testing.T) {
 		return nil
 	})
 
-	b1 := db.NewFileInfoBatch(func(fs []protocol.FileInfo) error {
+	b1 := model.NewFileInfoBatch(func(fs []protocol.FileInfo) error {
 		return c1.IndexUpdate(ctx, &protocol.IndexUpdate{Folder: "foo", Files: fs})
 	})
 	sentEntries := 0
-	for i := 0; i < msgs; i++ {
-		for j := 0; j < files; j++ {
+	for i := range int(msgs) {
+		for j := range int(files) {
 			b1.Append(protocol.FileInfo{
 				Name:   fmt.Sprintf("f%d-%d", i, j),
 				Blocks: []protocol.BlockInfo{{Hash: make([]byte, 32)}},

@@ -7,14 +7,17 @@
 package config
 
 import (
+	"cmp"
+	"log/slog"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/netutil"
@@ -27,6 +30,9 @@ import (
 // put the newest on top for readability.
 var (
 	migrations = migrationSet{
+		{52, migrateToConfigV52},
+		{51, migrateToConfigV51},
+		{50, migrateToConfigV50},
 		{37, migrateToConfigV37},
 		{36, migrateToConfigV36},
 		{35, migrateToConfigV35},
@@ -65,8 +71,8 @@ type migrationSet []migration
 func (ms migrationSet) apply(cfg *Configuration) {
 	// Make sure we apply the migrations in target version order regardless
 	// of how it was defined.
-	sort.Slice(ms, func(a, b int) bool {
-		return ms[a].targetVersion < ms[b].targetVersion
+	slices.SortFunc(ms, func(a, b migration) int {
+		return cmp.Compare(a.targetVersion, b.targetVersion)
 	})
 
 	// Apply all migrations.
@@ -102,6 +108,27 @@ func (m migration) apply(cfg *Configuration) {
 	cfg.Version = m.targetVersion
 }
 
+func migrateToConfigV52(cfg *Configuration) {
+	oldQuicInterval := max(cfg.Options.ReconnectIntervalS/3, 10)
+	cfg.Options.ReconnectIntervalS = min(cfg.Options.ReconnectIntervalS, oldQuicInterval)
+}
+
+func migrateToConfigV51(cfg *Configuration) {
+	oldDefault := 2
+	for i, fcfg := range cfg.Folders {
+		if fcfg.MaxConcurrentWrites == oldDefault {
+			cfg.Folders[i].MaxConcurrentWrites = maxConcurrentWritesDefault
+		}
+	}
+	if cfg.Defaults.Folder.MaxConcurrentWrites == oldDefault {
+		cfg.Defaults.Folder.MaxConcurrentWrites = maxConcurrentWritesDefault
+	}
+}
+
+func migrateToConfigV50(cfg *Configuration) {
+	// v50 is Syncthing 2.0
+}
+
 func migrateToConfigV37(cfg *Configuration) {
 	// "scan ownership" changed name to "send ownership"
 	for i := range cfg.Folders {
@@ -120,7 +147,7 @@ func migrateToConfigV35(cfg *Configuration) {
 	for i, fcfg := range cfg.Folders {
 		params := fcfg.Versioning.Params
 		if params["fsType"] != "" {
-			var fsType fs.FilesystemType
+			var fsType FilesystemType
 			_ = fsType.UnmarshalText([]byte(params["fsType"]))
 			cfg.Folders[i].Versioning.FSType = fsType
 		}
@@ -203,30 +230,23 @@ func migrateToConfigV24(cfg *Configuration) {
 }
 
 func migrateToConfigV23(cfg *Configuration) {
-	permBits := fs.FileMode(0o777)
-	if build.IsWindows {
-		// Windows has no umask so we must chose a safer set of bits to
-		// begin with.
-		permBits = 0o700
-	}
-
 	// Upgrade code remains hardcoded for .stfolder despite configurable
 	// marker name in later versions.
 
 	for i := range cfg.Folders {
-		fs := cfg.Folders[i].Filesystem(nil)
+		ffs := cfg.Folders[i].Filesystem()
 		// Invalid config posted, or tests.
-		if fs == nil {
+		if ffs == nil {
 			continue
 		}
-		if stat, err := fs.Stat(DefaultMarkerName); err == nil && !stat.IsDir() {
-			err = fs.Remove(DefaultMarkerName)
+		if stat, err := ffs.Stat(DefaultMarkerName); err == nil && !stat.IsDir() {
+			err = ffs.Remove(DefaultMarkerName)
 			if err == nil {
-				err = fs.Mkdir(DefaultMarkerName, permBits)
-				fs.Hide(DefaultMarkerName) // ignore error
+				err = ffs.Mkdir(DefaultMarkerName, fs.ModePerm)
+				ffs.Hide(DefaultMarkerName) // ignore error
 			}
 			if err != nil {
-				l.Infoln("Failed to upgrade folder marker:", err)
+				slog.Warn("Failed to upgrade folder marker", slogutil.Error(err))
 			}
 		}
 	}
@@ -234,7 +254,7 @@ func migrateToConfigV23(cfg *Configuration) {
 
 func migrateToConfigV22(cfg *Configuration) {
 	for i := range cfg.Folders {
-		cfg.Folders[i].FilesystemType = fs.FilesystemTypeBasic
+		cfg.Folders[i].FilesystemType = FilesystemTypeBasic
 		// Migrate to templated external versioner commands
 		if cfg.Folders[i].Versioning.Type == "external" {
 			cfg.Folders[i].Versioning.Params["command"] += " %FOLDER_PATH% %FILE_PATH%"
@@ -244,24 +264,24 @@ func migrateToConfigV22(cfg *Configuration) {
 
 func migrateToConfigV21(cfg *Configuration) {
 	for _, folder := range cfg.Folders {
-		if folder.FilesystemType != fs.FilesystemTypeBasic {
+		if folder.FilesystemType != FilesystemTypeBasic {
 			continue
 		}
 		switch folder.Versioning.Type {
 		case "simple", "trashcan":
 			// Clean out symlinks in the known place
-			cleanSymlinks(folder.Filesystem(nil), ".stversions")
+			cleanSymlinks(folder.Filesystem(), ".stversions")
 		case "staggered":
 			versionDir := folder.Versioning.Params["versionsPath"]
 			if versionDir == "" {
 				// default place
-				cleanSymlinks(folder.Filesystem(nil), ".stversions")
+				cleanSymlinks(folder.Filesystem(), ".stversions")
 			} else if filepath.IsAbs(versionDir) {
 				// absolute
 				cleanSymlinks(fs.NewFilesystem(fs.FilesystemTypeBasic, versionDir), ".")
 			} else {
 				// relative to folder
-				cleanSymlinks(folder.Filesystem(nil), versionDir)
+				cleanSymlinks(folder.Filesystem(), versionDir)
 			}
 		}
 	}
@@ -307,10 +327,6 @@ func migrateToConfigV15(cfg *Configuration) {
 }
 
 func migrateToConfigV14(cfg *Configuration) {
-	// Not using the ignore cache is the new default. Disable it on existing
-	// configurations.
-	cfg.Options.CacheIgnoredFiles = false
-
 	// Migrate UPnP -> NAT options
 	cfg.Options.NATEnabled = cfg.Options.DeprecatedUPnPEnabled
 	cfg.Options.DeprecatedUPnPEnabled = false
@@ -355,7 +371,7 @@ func migrateToConfigV14(cfg *Configuration) {
 	cfg.Options.DeprecatedRelayServers = nil
 
 	// For consistency
-	sort.Strings(cfg.Options.RawListenAddresses)
+	slices.Sort(cfg.Options.RawListenAddresses)
 
 	var newAddrs []string
 	for _, addr := range cfg.Options.RawGlobalAnnServers {
@@ -413,11 +429,12 @@ func migrateToConfigV12(cfg *Configuration) {
 	var newDiscoServers []string
 	var useDefault bool
 	for _, addr := range cfg.Options.RawGlobalAnnServers {
-		if addr == "udp4://announce.syncthing.net:22026" {
+		switch addr {
+		case "udp4://announce.syncthing.net:22026":
 			useDefault = true
-		} else if addr == "udp6://announce-v6.syncthing.net:22026" {
+		case "udp6://announce-v6.syncthing.net:22026":
 			useDefault = true
-		} else {
+		default:
 			newDiscoServers = append(newDiscoServers, addr)
 		}
 	}

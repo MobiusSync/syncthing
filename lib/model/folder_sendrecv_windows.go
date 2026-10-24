@@ -7,7 +7,7 @@
 package model
 
 import (
-	"errors"
+	"fmt"
 	"os/user"
 	"strings"
 
@@ -20,13 +20,13 @@ func (f *sendReceiveFolder) syncOwnership(file *protocol.FileInfo, path string) 
 		return nil
 	}
 
-	l.Debugln("Owner name for %s is %s (group=%v)", path, file.Platform.Windows.OwnerName, file.Platform.Windows.OwnerIsGroup)
+	l.Debugf("Owner name for %s is %s (group=%v)", path, file.Platform.Windows.OwnerName, file.Platform.Windows.OwnerIsGroup)
 	usid, gsid, err := lookupUserAndGroup(file.Platform.Windows.OwnerName, file.Platform.Windows.OwnerIsGroup)
 	if err != nil {
 		return err
 	}
 
-	l.Debugln("Owner for %s resolved to uid=%q gid=%q", path, usid, gsid)
+	l.Debugf("Owner for %s resolved to uid=%q gid=%q", path, usid, gsid)
 	return f.mtimefs.Lchown(path, usid, gsid)
 }
 
@@ -44,7 +44,7 @@ func lookupUserAndGroup(name string, group bool) (string, string, error) {
 			return "", err
 		})
 		if err != nil {
-			return "", "", err
+			return "", "", fmt.Errorf("lookup group %v: %w", name, err)
 		}
 		return "", gr, nil
 	}
@@ -57,7 +57,7 @@ func lookupUserAndGroup(name string, group bool) (string, string, error) {
 		return "", err
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("lookup user %v: %w", name, err)
 	}
 	return us, "", nil
 }
@@ -74,9 +74,9 @@ func lookupWithoutDomain(name string, lookup func(s string) (string, error)) (st
 	}
 	parts := strings.Split(name, `\`)
 	if len(parts) == 2 {
-		if v, err := lookup(parts[1]); err == nil {
+		if v, err = lookup(parts[1]); err == nil {
 			return v, nil
 		}
 	}
-	return "", errors.New("lookup failed")
+	return "", err
 }

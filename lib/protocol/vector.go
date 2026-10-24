@@ -1,15 +1,120 @@
-// Copyright (C) 2015 The Protocol Authors.
+// Copyright (C) 2015 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
 
-import "time"
+import (
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/syncthing/syncthing/internal/gen/bep"
+)
 
 // The Vector type represents a version vector. The zero value is a usable
 // version vector. The vector has slice semantics and some operations on it
 // are "append-like" in that they may return the same vector modified, or v
 // new allocated Vector with the modified contents.
+type Vector struct {
+	Counters []Counter
+}
+
+func (v *Vector) String() string {
+	var buf strings.Builder
+	for i, c := range v.Counters {
+		if i > 0 {
+			buf.WriteRune(',')
+		}
+		var idbs [8]byte
+		binary.BigEndian.PutUint64(idbs[:], uint64(c.ID))
+		fmt.Fprintf(&buf, "%x:%d", idbs, c.Value)
+	}
+	return buf.String()
+}
+
+func (v *Vector) HumanString() string {
+	var buf strings.Builder
+	for i, c := range v.Counters {
+		if i > 0 {
+			buf.WriteRune(',')
+		}
+		fmt.Fprintf(&buf, "%s:%d", c.ID, c.Value)
+	}
+	return buf.String()
+}
+
+func (v *Vector) ToWire() *bep.Vector {
+	counters := make([]*bep.Counter, len(v.Counters))
+	for i, c := range v.Counters {
+		counters[i] = c.toWire()
+	}
+	return &bep.Vector{
+		Counters: counters,
+	}
+}
+
+func VectorFromWire(w *bep.Vector) Vector {
+	var v Vector
+	if w == nil || len(w.Counters) == 0 {
+		return v
+	}
+	v.Counters = make([]Counter, len(w.Counters))
+	for i, c := range w.Counters {
+		v.Counters[i] = counterFromWire(c)
+	}
+	return v
+}
+
+func VectorFromString(s string) (Vector, error) {
+	pairs := strings.Split(s, ",")
+	var v Vector
+	v.Counters = make([]Counter, len(pairs))
+	for i, pair := range pairs {
+		idStr, valStr, ok := strings.Cut(pair, ":")
+		if !ok {
+			return Vector{}, fmt.Errorf("bad pair %q", pair)
+		}
+		idslice, err := hex.DecodeString(idStr)
+		if err != nil {
+			return Vector{}, fmt.Errorf("bad id in pair %q", pair)
+		}
+		var idbs [8]byte
+		copy(idbs[8-len(idslice):], idslice)
+		id := binary.BigEndian.Uint64(idbs[:])
+		val, err := strconv.ParseUint(valStr, 10, 64)
+		if err != nil {
+			return Vector{}, fmt.Errorf("bad val in pair %q", pair)
+		}
+		v.Counters[i] = Counter{ID: ShortID(id), Value: val}
+	}
+	return v, nil
+}
 
 // Counter represents a single counter in the version vector.
+type Counter struct {
+	ID    ShortID
+	Value uint64
+}
+
+func (c *Counter) toWire() *bep.Counter {
+	return &bep.Counter{
+		Id:    uint64(c.ID),
+		Value: c.Value,
+	}
+}
+
+func counterFromWire(w *bep.Counter) Counter {
+	return Counter{
+		ID:    ShortID(w.Id),
+		Value: w.Value,
+	}
+}
 
 // Update returns a Vector with the index for the specific ID incremented by
 // one. If it is possible, the vector v is updated and returned. If it is not,

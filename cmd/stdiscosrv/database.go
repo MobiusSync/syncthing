@@ -4,9 +4,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate go run ../../proto/scripts/protofmt.go database.proto
-//go:generate protoc -I ../../ -I . --gogofast_out=. database.proto
-
 package main
 
 import (
@@ -16,18 +13,22 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"os"
-	"path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v3"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/blob"
+	"github.com/syncthing/syncthing/internal/gen/discosrv"
+	"github.com/syncthing/syncthing/internal/protoutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/s3"
 )
 
 type clock interface {
@@ -41,61 +42,61 @@ func (defaultClock) Now() time.Time {
 }
 
 type database interface {
-	put(key *protocol.DeviceID, rec DatabaseRecord) error
-	merge(key *protocol.DeviceID, addrs []DatabaseAddress, seen int64) error
-	get(key *protocol.DeviceID) (DatabaseRecord, error)
+	put(key *protocol.DeviceID, rec *discosrv.DatabaseRecord) error
+	merge(key *protocol.DeviceID, addrs []*discosrv.DatabaseAddress, seen int64) error
+	get(key *protocol.DeviceID) (*discosrv.DatabaseRecord, error)
 }
 
 type inMemoryStore struct {
-	m             *xsync.MapOf[protocol.DeviceID, DatabaseRecord]
+	m             *xsync.MapOf[protocol.DeviceID, *discosrv.DatabaseRecord]
 	dir           string
 	flushInterval time.Duration
-	s3            *s3.Session
+	blobs         blob.Store
 	objKey        string
 	clock         clock
 }
 
-func newInMemoryStore(dir string, flushInterval time.Duration, s3sess *s3.Session) *inMemoryStore {
+func newInMemoryStore(dir string, flushInterval time.Duration, blobs blob.Store) *inMemoryStore {
 	hn, err := os.Hostname()
 	if err != nil {
 		hn = rand.String(8)
 	}
 	s := &inMemoryStore{
-		m:             xsync.NewMapOf[protocol.DeviceID, DatabaseRecord](),
+		m:             xsync.NewMapOf[protocol.DeviceID, *discosrv.DatabaseRecord](),
 		dir:           dir,
 		flushInterval: flushInterval,
-		s3:            s3sess,
+		blobs:         blobs,
 		objKey:        hn + ".db",
 		clock:         defaultClock{},
 	}
 	nr, err := s.read()
-	if os.IsNotExist(err) && s3sess != nil {
-		// Try to read from AWS
-		latestKey, cerr := s3sess.LatestKey()
+	if os.IsNotExist(err) && blobs != nil {
+		// Try to read from blob storage
+		latestKey, cerr := blobs.LatestKey(context.Background())
 		if cerr != nil {
-			log.Println("Error reading database from S3:", err)
+			slog.Error("Failed to find database in blob storage", "error", cerr)
 			return s
 		}
-		fd, cerr := os.Create(path.Join(s.dir, "records.db"))
+		fd, cerr := os.Create(filepath.Join(s.dir, "records.db"))
 		if cerr != nil {
-			log.Println("Error creating database file:", err)
+			slog.Error("Failed to create database file", "error", cerr)
 			return s
 		}
-		if cerr := s3sess.Download(fd, latestKey); cerr != nil {
-			log.Printf("Error reading database from S3: %v", err)
+		if cerr := blobs.Download(context.Background(), latestKey, fd); cerr != nil {
+			slog.Error("Failed to download database from blob storage", "error", cerr)
 		}
 		_ = fd.Close()
 		nr, err = s.read()
 	}
 	if err != nil {
-		log.Println("Error reading database:", err)
+		slog.Error("Failed to read database", "error", err)
 	}
-	log.Printf("Read %d records from database", nr)
+	slog.Info("Loaded database", "records", nr)
 	s.expireAndCalculateStatistics()
 	return s
 }
 
-func (s *inMemoryStore) put(key *protocol.DeviceID, rec DatabaseRecord) error {
+func (s *inMemoryStore) put(key *protocol.DeviceID, rec *discosrv.DatabaseRecord) error {
 	t0 := time.Now()
 	s.m.Store(*key, rec)
 	databaseOperations.WithLabelValues(dbOpPut, dbResSuccess).Inc()
@@ -103,16 +104,17 @@ func (s *inMemoryStore) put(key *protocol.DeviceID, rec DatabaseRecord) error {
 	return nil
 }
 
-func (s *inMemoryStore) merge(key *protocol.DeviceID, addrs []DatabaseAddress, seen int64) error {
+func (s *inMemoryStore) merge(key *protocol.DeviceID, addrs []*discosrv.DatabaseAddress, seen int64) error {
 	t0 := time.Now()
 
-	newRec := DatabaseRecord{
+	newRec := &discosrv.DatabaseRecord{
 		Addresses: addrs,
 		Seen:      seen,
 	}
 
-	oldRec, _ := s.m.Load(*key)
-	newRec = merge(oldRec, newRec)
+	if oldRec, ok := s.m.Load(*key); ok {
+		newRec = merge(newRec, oldRec)
+	}
 	s.m.Store(*key, newRec)
 
 	databaseOperations.WithLabelValues(dbOpMerge, dbResSuccess).Inc()
@@ -121,7 +123,7 @@ func (s *inMemoryStore) merge(key *protocol.DeviceID, addrs []DatabaseAddress, s
 	return nil
 }
 
-func (s *inMemoryStore) get(key *protocol.DeviceID) (DatabaseRecord, error) {
+func (s *inMemoryStore) get(key *protocol.DeviceID) (*discosrv.DatabaseRecord, error) {
 	t0 := time.Now()
 	defer func() {
 		databaseOperationSeconds.WithLabelValues(dbOpGet).Observe(time.Since(t0).Seconds())
@@ -130,10 +132,16 @@ func (s *inMemoryStore) get(key *protocol.DeviceID) (DatabaseRecord, error) {
 	rec, ok := s.m.Load(*key)
 	if !ok {
 		databaseOperations.WithLabelValues(dbOpGet, dbResNotFound).Inc()
-		return DatabaseRecord{}, nil
+		return &discosrv.DatabaseRecord{}, nil
 	}
 
-	rec.Addresses = expire(rec.Addresses, s.clock.Now())
+	naddresses, changed := expire(rec.Addresses, s.clock.Now())
+	if changed {
+		rec = &discosrv.DatabaseRecord{
+			Addresses: naddresses,
+			Seen:      rec.Seen,
+		}
+	}
 	databaseOperations.WithLabelValues(dbOpGet, dbResSuccess).Inc()
 	return rec, nil
 }
@@ -151,13 +159,13 @@ loop:
 	for {
 		select {
 		case <-t.C:
-			log.Println("Calculating statistics")
+			slog.InfoContext(ctx, "Calculating statistics")
 			s.expireAndCalculateStatistics()
-			log.Println("Flushing database")
+			slog.InfoContext(ctx, "Flushing database")
 			if err := s.write(); err != nil {
-				log.Println("Error writing database:", err)
+				slog.ErrorContext(ctx, "Failed to write database", "error", err)
 			}
-			log.Println("Finished flushing database")
+			slog.InfoContext(ctx, "Finished flushing database")
 			t.Reset(s.flushInterval)
 
 		case <-ctx.Done():
@@ -176,18 +184,18 @@ func (s *inMemoryStore) expireAndCalculateStatistics() {
 	current, currentIPv4, currentIPv6, currentIPv6GUA, last24h, last1w := 0, 0, 0, 0, 0, 0
 
 	n := 0
-	s.m.Range(func(key protocol.DeviceID, rec DatabaseRecord) bool {
+	s.m.Range(func(key protocol.DeviceID, rec *discosrv.DatabaseRecord) bool {
 		if n%1000 == 0 {
 			runtime.Gosched()
 		}
 		n++
 
-		addresses := expire(rec.Addresses, now)
-		if len(addresses) == 0 {
-			rec.Addresses = nil
-			s.m.Store(key, rec)
-		} else if len(addresses) != len(rec.Addresses) {
-			rec.Addresses = addresses
+		addresses, changed := expire(rec.Addresses, now)
+		if changed {
+			rec = &discosrv.DatabaseRecord{
+				Addresses: addresses,
+				Seen:      rec.Seen,
+			}
 			s.m.Store(key, rec)
 		}
 
@@ -249,19 +257,19 @@ func (s *inMemoryStore) write() (err error) {
 		}
 	}()
 
-	dbf := path.Join(s.dir, "records.db")
+	dbf := filepath.Join(s.dir, "records.db")
 	fd, err := os.Create(dbf + ".tmp")
 	if err != nil {
 		return err
 	}
-	bw := bufio.NewWriter(fd)
+	bw := bufio.NewWriterSize(fd, 1<<20)
 
 	var buf []byte
 	var rangeErr error
 	now := s.clock.Now()
 	cutoff1w := now.Add(-7 * 24 * time.Hour).UnixNano()
 	n := 0
-	s.m.Range(func(key protocol.DeviceID, value DatabaseRecord) bool {
+	s.m.Range(func(key protocol.DeviceID, value *discosrv.DatabaseRecord) bool {
 		if n%1000 == 0 {
 			runtime.Gosched()
 		}
@@ -271,16 +279,16 @@ func (s *inMemoryStore) write() (err error) {
 			// drop the record if it's older than a week
 			return true
 		}
-		rec := ReplicationRecord{
+		rec := &discosrv.ReplicationRecord{
 			Key:       key[:],
 			Addresses: value.Addresses,
 			Seen:      value.Seen,
 		}
-		s := rec.Size()
+		s := proto.Size(rec)
 		if s+4 > len(buf) {
 			buf = make([]byte, s+4)
 		}
-		n, err := rec.MarshalTo(buf[4:])
+		n, err := protoutil.MarshalTo(buf[4:], rec)
 		if err != nil {
 			rangeErr = err
 			return false
@@ -298,7 +306,7 @@ func (s *inMemoryStore) write() (err error) {
 	}
 
 	if err := bw.Flush(); err != nil {
-		_ = fd.Close
+		_ = fd.Close()
 		return err
 	}
 	if err := fd.Close(); err != nil {
@@ -308,25 +316,31 @@ func (s *inMemoryStore) write() (err error) {
 		return err
 	}
 
-	// Upload to S3
-	if s.s3 != nil {
+	if info, err := os.Lstat(dbf); err == nil {
+		slog.Info("Saved database", "name", dbf, "size", info.Size(), "modtime", info.ModTime())
+	} else {
+		slog.Warn("Failed to stat database after save", "error", err)
+	}
+
+	// Upload to blob storage
+	if s.blobs != nil {
 		fd, err = os.Open(dbf)
 		if err != nil {
-			log.Printf("Error uploading database to S3: %v", err)
+			slog.Error("Failed to upload database to blob storage", "error", err)
 			return nil
 		}
 		defer fd.Close()
-		if err := s.s3.Upload(fd, s.objKey); err != nil {
-			log.Printf("Error uploading database to S3: %v", err)
+		if err := s.blobs.Upload(context.Background(), s.objKey, fd); err != nil {
+			slog.Error("Failed to upload database to blob storage", "error", err)
 		}
-		log.Println("Finished uploading database")
+		slog.Info("Finished uploading database")
 	}
 
 	return nil
 }
 
 func (s *inMemoryStore) read() (int, error) {
-	fd, err := os.Open(path.Join(s.dir, "records.db"))
+	fd, err := os.Open(filepath.Join(s.dir, "records.db"))
 	if err != nil {
 		return 0, err
 	}
@@ -349,8 +363,8 @@ func (s *inMemoryStore) read() (int, error) {
 		if _, err := io.ReadFull(br, buf[:n]); err != nil {
 			return nr, err
 		}
-		rec := ReplicationRecord{}
-		if err := rec.Unmarshal(buf[:n]); err != nil {
+		rec := &discosrv.ReplicationRecord{}
+		if err := proto.Unmarshal(buf[:n], rec); err != nil {
 			return nr, err
 		}
 		key, err := protocol.DeviceIDFromBytes(rec.Key)
@@ -358,14 +372,14 @@ func (s *inMemoryStore) read() (int, error) {
 			key, err = protocol.DeviceIDFromString(string(rec.Key))
 		}
 		if err != nil {
-			log.Println("Bad device ID:", err)
+			slog.Error("Got bad device ID while reading database", "error", err)
 			continue
 		}
 
-		slices.SortFunc(rec.Addresses, DatabaseAddress.Cmp)
-		rec.Addresses = slices.CompactFunc(rec.Addresses, DatabaseAddress.Equal)
-		s.m.Store(key, DatabaseRecord{
-			Addresses: expire(rec.Addresses, s.clock.Now()),
+		slices.SortFunc(rec.Addresses, Cmp)
+		rec.Addresses, _ = expire(slices.CompactFunc(rec.Addresses, Equal), s.clock.Now())
+		s.m.Store(key, &discosrv.DatabaseRecord{
+			Addresses: rec.Addresses,
 			Seen:      rec.Seen,
 		})
 		nr++
@@ -376,8 +390,8 @@ func (s *inMemoryStore) read() (int, error) {
 // merge returns the merged result of the two database records a and b. The
 // result is the union of the two address sets, with the newer expiry time
 // chosen for any duplicates. The address list in a is overwritten and
-// reused for the result.
-func merge(a, b DatabaseRecord) DatabaseRecord {
+// reused for the result; b is not modified.
+func merge(a, b *discosrv.DatabaseRecord) *discosrv.DatabaseRecord {
 	// Both lists must be sorted for this to work.
 
 	a.Seen = max(a.Seen, b.Seen)
@@ -396,7 +410,7 @@ func merge(a, b DatabaseRecord) DatabaseRecord {
 			aIdx++
 		case 1:
 			// a > b, insert b before a
-			a.Addresses = append(a.Addresses[:aIdx], append([]DatabaseAddress{b.Addresses[bIdx]}, a.Addresses[aIdx:]...)...)
+			a.Addresses = append(a.Addresses[:aIdx], append([]*discosrv.DatabaseAddress{b.Addresses[bIdx]}, a.Addresses[aIdx:]...)...)
 			bIdx++
 		}
 	}
@@ -407,34 +421,42 @@ func merge(a, b DatabaseRecord) DatabaseRecord {
 	return a
 }
 
-// expire returns the list of addresses after removing expired entries.
-// Expiration happen in place, so the slice given as the parameter is
-// destroyed. Internal order is preserved.
-func expire(addrs []DatabaseAddress, now time.Time) []DatabaseAddress {
+// expire returns the list of addresses after removing expired entries. A
+// new slice is allocated if any changes are required, and the changed
+// boolean indicates whether that happened or not.
+func expire(addrs []*discosrv.DatabaseAddress, now time.Time) (result []*discosrv.DatabaseAddress, changed bool) {
 	cutoff := now.UnixNano()
-	naddrs := addrs[:0]
-	for i := range addrs {
-		if i > 0 && addrs[i].Address == addrs[i-1].Address {
-			// Skip duplicates
-			continue
-		}
-		if addrs[i].Expires >= cutoff {
-			naddrs = append(naddrs, addrs[i])
+	remains := 0
+	for _, a := range addrs {
+		if a.Expires < cutoff {
+			changed = true
+		} else {
+			remains++
 		}
 	}
-	if len(naddrs) == 0 {
-		return nil
+	if !changed {
+		return addrs, false
 	}
-	return naddrs
+	if remains == 0 {
+		return nil, true
+	}
+
+	naddrs := make([]*discosrv.DatabaseAddress, 0, remains)
+	for _, a := range addrs {
+		if a.Expires >= cutoff {
+			naddrs = append(naddrs, a)
+		}
+	}
+	return naddrs, true
 }
 
-func (d DatabaseAddress) Cmp(other DatabaseAddress) (n int) {
+func Cmp(d, other *discosrv.DatabaseAddress) (n int) {
 	if c := cmp.Compare(d.Address, other.Address); c != 0 {
 		return c
 	}
 	return cmp.Compare(d.Expires, other.Expires)
 }
 
-func (d DatabaseAddress) Equal(other DatabaseAddress) bool {
+func Equal(d, other *discosrv.DatabaseAddress) bool {
 	return d.Address == other.Address
 }

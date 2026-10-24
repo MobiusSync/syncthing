@@ -1,45 +1,48 @@
-// Copyright (C) 2014 The Protocol Authors.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"os"
+	"strings"
 	"sync"
 	"testing"
-	"testing/quick"
 	"time"
 
 	lz4 "github.com/pierrec/lz4/v4"
-	"github.com/syncthing/syncthing/lib/build"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/syncthing/syncthing/internal/gen/bep"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/testutil"
 )
 
 var (
-	c0ID     = NewDeviceID([]byte{1})
-	c1ID     = NewDeviceID([]byte{2})
-	quickCfg = &quick.Config{}
+	c0ID = NewDeviceID([]byte{1})
+	c1ID = NewDeviceID([]byte{2})
 )
 
 func TestPing(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c0.Start()
 	defer closeAndWait(c0, ar, bw)
-	c1 := getRawConnection(NewConnection(c1ID, br, aw, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c1 := getRawConnection(NewConnection(c1ID, br, aw, testutil.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c1.Start()
 	defer closeAndWait(c1, ar, bw)
-	c0.ClusterConfig(&ClusterConfig{})
-	c1.ClusterConfig(&ClusterConfig{})
+	c0.ClusterConfig(&ClusterConfig{}, nil)
+	c1.ClusterConfig(&ClusterConfig{}, nil)
 
 	if ok := c0.ping(); !ok {
 		t.Error("c0 ping failed")
@@ -58,14 +61,14 @@ func TestClose(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c0.Start()
 	defer closeAndWait(c0, ar, bw)
-	c1 := NewConnection(c1ID, br, aw, testutil.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen)
+	c1 := NewConnection(c1ID, br, aw, testutil.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionAlways, testKeyGen)
 	c1.Start()
 	defer closeAndWait(c1, ar, bw)
-	c0.ClusterConfig(&ClusterConfig{})
-	c1.ClusterConfig(&ClusterConfig{})
+	c0.ClusterConfig(&ClusterConfig{}, nil)
+	c1.ClusterConfig(&ClusterConfig{}, nil)
 
 	c0.internalClose(errManual)
 
@@ -103,30 +106,24 @@ func TestCloseOnBlockingSend(t *testing.T) {
 	m := newTestModel()
 
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c.Start()
 	defer closeAndWait(c, rw)
 
 	wg := sync.WaitGroup{}
 
-	wg.Add(1)
-	go func() {
-		c.ClusterConfig(&ClusterConfig{})
-		wg.Done()
-	}()
+	wg.Go(func() {
+		c.ClusterConfig(&ClusterConfig{}, nil)
+	})
 
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		c.Close(errManual)
-		wg.Done()
-	}()
+	})
 
 	// This simulates an error from ping timeout
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		c.internalClose(ErrTimeout)
-		wg.Done()
-	}()
+	})
 
 	done := make(chan struct{})
 	go func() {
@@ -154,14 +151,14 @@ func TestCloseRace(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionNever, nil, testKeyGen))
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutil.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionNever, testKeyGen))
 	c0.Start()
 	defer closeAndWait(c0, ar, bw)
-	c1 := NewConnection(c1ID, br, aw, testutil.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionNever, nil, testKeyGen)
+	c1 := NewConnection(c1ID, br, aw, testutil.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionNever, testKeyGen)
 	c1.Start()
 	defer closeAndWait(c1, ar, bw)
-	c0.ClusterConfig(&ClusterConfig{})
-	c1.ClusterConfig(&ClusterConfig{})
+	c0.ClusterConfig(&ClusterConfig{}, nil)
+	c1.ClusterConfig(&ClusterConfig{}, nil)
 
 	c1.Index(context.Background(), &Index{Folder: "default"})
 	select {
@@ -194,21 +191,21 @@ func TestClusterConfigFirst(t *testing.T) {
 	m := newTestModel()
 
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c.Start()
 	defer closeAndWait(c, rw)
 
 	select {
-	case c.outbox <- asyncMessage{&Ping{}, nil}:
+	case c.outbox <- asyncMessage{&bep.Ping{}, nil}:
 		t.Fatal("able to send ping before cluster config")
 	case <-time.After(100 * time.Millisecond):
-		// Allow some time for c.writerLoop to setup after c.Start
+		// Allow some time for c.writerLoop to set up after c.Start
 	}
 
-	c.ClusterConfig(&ClusterConfig{})
+	c.ClusterConfig(&ClusterConfig{}, nil)
 
 	done := make(chan struct{})
-	if ok := c.send(context.Background(), &Ping{}, done); !ok {
+	if ok := c.send(context.Background(), &bep.Ping{}, done); !ok {
 		t.Fatal("send ping after cluster config returned false")
 	}
 	select {
@@ -246,7 +243,7 @@ func TestCloseTimeout(t *testing.T) {
 	m := newTestModel()
 
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c.Start()
 	defer closeAndWait(c, rw)
 
@@ -263,181 +260,18 @@ func TestCloseTimeout(t *testing.T) {
 	}
 }
 
-func TestMarshalIndexMessage(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 Index) bool {
-		if len(m1.Files) == 0 {
-			m1.Files = nil
-		}
-		for i, f := range m1.Files {
-			if len(f.BlocksHash) == 0 {
-				m1.Files[i].BlocksHash = nil
-			}
-			if len(f.VersionHash) == 0 {
-				m1.Files[i].VersionHash = nil
-			}
-			if len(f.Blocks) == 0 {
-				m1.Files[i].Blocks = nil
-			} else {
-				for j := range f.Blocks {
-					f.Blocks[j].Offset = 0
-					if len(f.Blocks[j].Hash) == 0 {
-						f.Blocks[j].Hash = nil
-					}
-				}
-			}
-			if len(f.Version.Counters) == 0 {
-				m1.Files[i].Version.Counters = nil
-			}
-			if len(f.Encrypted) == 0 {
-				m1.Files[i].Encrypted = nil
-			}
-		}
-
-		return testMarshal(t, "index", &m1, &Index{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestMarshalRequestMessage(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 Request) bool {
-		if len(m1.Hash) == 0 {
-			m1.Hash = nil
-		}
-		return testMarshal(t, "request", &m1, &Request{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestMarshalResponseMessage(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 Response) bool {
-		if len(m1.Data) == 0 {
-			m1.Data = nil
-		}
-		return testMarshal(t, "response", &m1, &Response{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestMarshalClusterConfigMessage(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 ClusterConfig) bool {
-		if len(m1.Folders) == 0 {
-			m1.Folders = nil
-		}
-		for i := range m1.Folders {
-			if len(m1.Folders[i].Devices) == 0 {
-				m1.Folders[i].Devices = nil
-			}
-			for j := range m1.Folders[i].Devices {
-				if len(m1.Folders[i].Devices[j].Addresses) == 0 {
-					m1.Folders[i].Devices[j].Addresses = nil
-				}
-				if len(m1.Folders[i].Devices[j].EncryptionPasswordToken) == 0 {
-					m1.Folders[i].Devices[j].EncryptionPasswordToken = nil
-				}
-			}
-		}
-
-		return testMarshal(t, "clusterconfig", &m1, &ClusterConfig{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestMarshalCloseMessage(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 Close) bool {
-		return testMarshal(t, "close", &m1, &Close{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestMarshalFDPU(t *testing.T) {
-	if testing.Short() {
-		quickCfg.MaxCount = 10
-	}
-
-	f := func(m1 FileDownloadProgressUpdate) bool {
-		if len(m1.Version.Counters) == 0 {
-			m1.Version.Counters = nil
-		}
-		if len(m1.BlockIndexes) == 0 {
-			m1.BlockIndexes = nil
-		}
-		return testMarshal(t, "fdpu", &m1, &FileDownloadProgressUpdate{})
-	}
-
-	if err := quick.Check(f, quickCfg); err != nil {
-		t.Error(err)
-	}
-}
-
 func TestUnmarshalFDPUv16v17(t *testing.T) {
-	var fdpu FileDownloadProgressUpdate
+	var fdpu bep.FileDownloadProgressUpdate
 
 	m0, _ := hex.DecodeString("08cda1e2e3011278f3918787f3b89b8af2958887f0aa9389f3a08588f3aa8f96f39aa8a5f48b9188f19286a0f3848da4f3aba799f3beb489f0a285b9f487b684f2a3bda2f48598b4f2938a89f2a28badf187a0a2f2aebdbdf4849494f4808fbbf2b3a2adf2bb95bff0a6ada4f198ab9af29a9c8bf1abb793f3baabb2f188a6ba1a0020bb9390f60220f6d9e42220b0c7e2b2fdffffffff0120fdb2dfcdfbffffffff0120cedab1d50120bd8784c0feffffffff0120ace99591fdffffffff0120eed7d09af9ffffffff01")
-	if err := fdpu.Unmarshal(m0); err != nil {
+	if err := proto.Unmarshal(m0, &fdpu); err != nil {
 		t.Fatal("Unmarshalling message from v0.14.16:", err)
 	}
 
 	m1, _ := hex.DecodeString("0880f1969905128401f099b192f0abb1b9f3b280aff19e9aa2f3b89e84f484b39df1a7a6b0f1aea4b1f0adac94f3b39caaf1939281f1928a8af0abb1b0f0a8b3b3f3a88e94f2bd85acf29c97a9f2969da6f0b7a188f1908ea2f09a9c9bf19d86a6f29aada8f389bb95f0bf9d88f1a09d89f1b1a4b5f29b9eabf298a59df1b2a589f2979ebdf0b69880f18986b21a440a1508c7d8fb8897ca93d90910e8c4d8e8f2f8f0ccee010a1508afa8ffd8c085b393c50110e5bdedc3bddefe9b0b0a1408a1bedddba4cac5da3c10b8e5d9958ca7e3ec19225ae2f88cb2f8ffffffff018ceda99cfbffffffff01b9c298a407e295e8e9fcffffffff01f3b9ade5fcffffffff01c08bfea9fdffffffff01a2c2e5e1ffffffffff0186dcc5dafdffffffff01e9ffc7e507c9d89db8fdffffffff01")
-	if err := fdpu.Unmarshal(m1); err != nil {
+	if err := proto.Unmarshal(m1, &fdpu); err != nil {
 		t.Fatal("Unmarshalling message from v0.14.16:", err)
 	}
-}
-
-func testMarshal(t *testing.T, prefix string, m1, m2 message) bool {
-	buf, err := m1.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = m2.Unmarshal(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bs1, _ := json.MarshalIndent(m1, "", "  ")
-	bs2, _ := json.MarshalIndent(m2, "", "  ")
-	if !bytes.Equal(bs1, bs2) {
-		os.WriteFile(prefix+"-1.txt", bs1, 0o644)
-		os.WriteFile(prefix+"-2.txt", bs2, 0o644)
-		return false
-	}
-
-	return true
 }
 
 func TestWriteCompressed(t *testing.T) {
@@ -449,9 +283,9 @@ func TestWriteCompressed(t *testing.T) {
 			compression: CompressionAlways,
 		}
 
-		msg := &Response{Data: make([]byte, 10240)}
+		msg := (&Response{Data: make([]byte, 10240)}).toWire()
 		if random {
-			// This should make the message uncompressible.
+			// This should make the message incompressible.
 			rand.Read(msg.Data)
 		}
 
@@ -462,12 +296,12 @@ func TestWriteCompressed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(got.(*Response).Data, msg.Data) {
+		if !bytes.Equal(got.(*bep.Response).Data, msg.Data) {
 			t.Error("received the wrong message")
 		}
 
-		hdr := Header{Type: typeOf(msg)}
-		size := int64(2 + hdr.ProtoSize() + 4 + msg.ProtoSize())
+		hdr := &bep.Header{Type: typeOf(msg)}
+		size := int64(2 + proto.Size(hdr) + 4 + proto.Size(msg))
 		if c.cr.Tot() > size {
 			t.Errorf("compression enlarged message from %d to %d",
 				size, c.cr.Tot())
@@ -476,7 +310,7 @@ func TestWriteCompressed(t *testing.T) {
 }
 
 func TestLZ4Compression(t *testing.T) {
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		dataLen := 150 + rand.Intn(150)
 		data := make([]byte, dataLen)
 		_, err := io.ReadFull(rand.Reader, data[100:])
@@ -617,6 +451,61 @@ func TestCheckConsistency(t *testing.T) {
 			},
 			ok: false,
 		},
+		{
+			// directory with zero size
+			fi: FileInfo{
+				Name: "foo",
+				Type: FileInfoTypeDirectory,
+			},
+			ok: true,
+		},
+		{
+			// directory with synthetic size
+			fi: FileInfo{
+				Name: "foo",
+				Type: FileInfoTypeDirectory,
+				Size: deprecatedSyntheticDirectorySize,
+			},
+			ok: true,
+		},
+		{
+			// directory with arbitrary size
+			fi: FileInfo{
+				Name: "foo",
+				Type: FileInfoTypeDirectory,
+				Size: 42,
+			},
+			ok: false,
+		},
+		{
+			// symlink with zero size
+			fi: FileInfo{
+				Name:          "foo",
+				Type:          FileInfoTypeSymlink,
+				SymlinkTarget: []byte("bar"),
+			},
+			ok: true,
+		},
+		{
+			// symlink with synthetic directory size (not permitted)
+			fi: FileInfo{
+				Name:          "foo",
+				Type:          FileInfoTypeSymlink,
+				SymlinkTarget: []byte("bar"),
+				Size:          deprecatedSyntheticDirectorySize,
+			},
+			ok: false,
+		},
+		{
+			// symlink with arbitrary size
+			fi: FileInfo{
+				Name:          "foo",
+				Type:          FileInfoTypeSymlink,
+				SymlinkTarget: []byte("bar"),
+				Size:          42,
+			},
+			ok: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -663,243 +552,13 @@ func BenchmarkBlockSize(b *testing.B) {
 	}
 }
 
-func TestLocalFlagBits(t *testing.T) {
-	var f FileInfo
-	if f.IsIgnored() || f.MustRescan() || f.IsInvalid() {
-		t.Error("file should have no weird bits set by default")
-	}
-
-	f.SetIgnored()
-	if !f.IsIgnored() || f.MustRescan() || !f.IsInvalid() {
-		t.Error("file should be ignored and invalid")
-	}
-
-	f.SetMustRescan()
-	if f.IsIgnored() || !f.MustRescan() || !f.IsInvalid() {
-		t.Error("file should be must-rescan and invalid")
-	}
-
-	f.SetUnsupported()
-	if f.IsIgnored() || f.MustRescan() || !f.IsInvalid() {
-		t.Error("file should be invalid")
-	}
-}
-
-func TestIsEquivalent(t *testing.T) {
-	b := func(v bool) *bool {
-		return &v
-	}
-
-	type testCase struct {
-		a         FileInfo
-		b         FileInfo
-		ignPerms  *bool // nil means should not matter, we'll test both variants
-		ignBlocks *bool
-		ignFlags  uint32
-		eq        bool
-	}
-	cases := []testCase{
-		// Empty FileInfos are equivalent
-		{eq: true},
-
-		// Various basic attributes, all of which cause inequality when
-		// they differ
-		{
-			a:  FileInfo{Name: "foo"},
-			b:  FileInfo{Name: "bar"},
-			eq: false,
-		},
-		{
-			a:  FileInfo{Type: FileInfoTypeFile},
-			b:  FileInfo{Type: FileInfoTypeDirectory},
-			eq: false,
-		},
-		{
-			a:  FileInfo{Size: 1234},
-			b:  FileInfo{Size: 2345},
-			eq: false,
-		},
-		{
-			a:  FileInfo{Deleted: false},
-			b:  FileInfo{Deleted: true},
-			eq: false,
-		},
-		{
-			a:  FileInfo{RawInvalid: false},
-			b:  FileInfo{RawInvalid: true},
-			eq: false,
-		},
-		{
-			a:  FileInfo{ModifiedS: 1234},
-			b:  FileInfo{ModifiedS: 2345},
-			eq: false,
-		},
-		{
-			a:  FileInfo{ModifiedNs: 1234},
-			b:  FileInfo{ModifiedNs: 2345},
-			eq: false,
-		},
-
-		// Special handling of local flags and invalidity. "MustRescan"
-		// files are never equivalent to each other. Otherwise, equivalence
-		// is based just on whether the file becomes IsInvalid() or not, not
-		// the specific reason or flag bits.
-		{
-			a:  FileInfo{LocalFlags: FlagLocalMustRescan},
-			b:  FileInfo{LocalFlags: FlagLocalMustRescan},
-			eq: false,
-		},
-		{
-			a:  FileInfo{RawInvalid: true},
-			b:  FileInfo{RawInvalid: true},
-			eq: true,
-		},
-		{
-			a:  FileInfo{LocalFlags: FlagLocalUnsupported},
-			b:  FileInfo{LocalFlags: FlagLocalUnsupported},
-			eq: true,
-		},
-		{
-			a:  FileInfo{RawInvalid: true},
-			b:  FileInfo{LocalFlags: FlagLocalUnsupported},
-			eq: true,
-		},
-		{
-			a:  FileInfo{LocalFlags: 0},
-			b:  FileInfo{LocalFlags: FlagLocalReceiveOnly},
-			eq: false,
-		},
-		{
-			a:        FileInfo{LocalFlags: 0},
-			b:        FileInfo{LocalFlags: FlagLocalReceiveOnly},
-			ignFlags: FlagLocalReceiveOnly,
-			eq:       true,
-		},
-
-		// Difference in blocks is not OK
-		{
-			a:         FileInfo{Blocks: []BlockInfo{{Hash: []byte{1, 2, 3, 4}}}},
-			b:         FileInfo{Blocks: []BlockInfo{{Hash: []byte{2, 3, 4, 5}}}},
-			ignBlocks: b(false),
-			eq:        false,
-		},
-
-		// ... unless we say it is
-		{
-			a:         FileInfo{Blocks: []BlockInfo{{Hash: []byte{1, 2, 3, 4}}}},
-			b:         FileInfo{Blocks: []BlockInfo{{Hash: []byte{2, 3, 4, 5}}}},
-			ignBlocks: b(true),
-			eq:        true,
-		},
-
-		// Difference in permissions is not OK.
-		{
-			a:        FileInfo{Permissions: 0o444},
-			b:        FileInfo{Permissions: 0o666},
-			ignPerms: b(false),
-			eq:       false,
-		},
-
-		// ... unless we say it is
-		{
-			a:        FileInfo{Permissions: 0o666},
-			b:        FileInfo{Permissions: 0o444},
-			ignPerms: b(true),
-			eq:       true,
-		},
-
-		// These attributes are not checked at all
-		{
-			a:  FileInfo{NoPermissions: false},
-			b:  FileInfo{NoPermissions: true},
-			eq: true,
-		},
-		{
-			a:  FileInfo{Version: Vector{Counters: []Counter{{ID: 1, Value: 42}}}},
-			b:  FileInfo{Version: Vector{Counters: []Counter{{ID: 42, Value: 1}}}},
-			eq: true,
-		},
-		{
-			a:  FileInfo{Sequence: 1},
-			b:  FileInfo{Sequence: 2},
-			eq: true,
-		},
-
-		// The block size is not checked (but this would fail the blocks
-		// check in real world)
-		{
-			a:  FileInfo{RawBlockSize: 1},
-			b:  FileInfo{RawBlockSize: 2},
-			eq: true,
-		},
-
-		// The symlink target is checked for symlinks
-		{
-			a:  FileInfo{Type: FileInfoTypeSymlink, SymlinkTarget: "a"},
-			b:  FileInfo{Type: FileInfoTypeSymlink, SymlinkTarget: "b"},
-			eq: false,
-		},
-
-		// ... but not for non-symlinks
-		{
-			a:  FileInfo{Type: FileInfoTypeFile, SymlinkTarget: "a"},
-			b:  FileInfo{Type: FileInfoTypeFile, SymlinkTarget: "b"},
-			eq: true,
-		},
-	}
-
-	if build.IsWindows {
-		// On windows we only check the user writable bit of the permission
-		// set, so these are equivalent.
-		cases = append(cases, testCase{
-			a:        FileInfo{Permissions: 0o777},
-			b:        FileInfo{Permissions: 0o600},
-			ignPerms: b(false),
-			eq:       true,
-		})
-	}
-
-	for i, tc := range cases {
-		// Check the standard attributes with all permutations of the
-		// special ignore flags, unless the value of those flags are given
-		// in the tests.
-		for _, ignPerms := range []bool{true, false} {
-			for _, ignBlocks := range []bool{true, false} {
-				if tc.ignPerms != nil && *tc.ignPerms != ignPerms {
-					continue
-				}
-				if tc.ignBlocks != nil && *tc.ignBlocks != ignBlocks {
-					continue
-				}
-
-				if res := tc.a.isEquivalent(tc.b, FileInfoComparison{IgnorePerms: ignPerms, IgnoreBlocks: ignBlocks, IgnoreFlags: tc.ignFlags}); res != tc.eq {
-					t.Errorf("Case %d:\na: %v\nb: %v\na.IsEquivalent(b, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
-				}
-				if res := tc.b.isEquivalent(tc.a, FileInfoComparison{IgnorePerms: ignPerms, IgnoreBlocks: ignBlocks, IgnoreFlags: tc.ignFlags}); res != tc.eq {
-					t.Errorf("Case %d:\na: %v\nb: %v\nb.IsEquivalent(a, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
-				}
-			}
-		}
-	}
-}
-
-func TestSha256OfEmptyBlock(t *testing.T) {
-	// every block size should have a correct entry in sha256OfEmptyBlock
-	for blockSize := MinBlockSize; blockSize <= MaxBlockSize; blockSize *= 2 {
-		expected := sha256.Sum256(make([]byte, blockSize))
-		if sha256OfEmptyBlock[blockSize] != expected {
-			t.Error("missing or wrong hash for block of size", blockSize)
-		}
-	}
-}
-
 // TestClusterConfigAfterClose checks that ClusterConfig does not deadlock when
 // ClusterConfig is called on a closed connection.
 func TestClusterConfigAfterClose(t *testing.T) {
 	m := newTestModel()
 
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c.Start()
 	defer closeAndWait(c, rw)
 
@@ -907,7 +566,7 @@ func TestClusterConfigAfterClose(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.ClusterConfig(&ClusterConfig{})
+		c.ClusterConfig(&ClusterConfig{}, nil)
 		close(done)
 	}()
 
@@ -923,14 +582,14 @@ func TestDispatcherToCloseDeadlock(t *testing.T) {
 	// the model callbacks (ClusterConfig).
 	m := newTestModel()
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
+	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	m.ccFn = func(*ClusterConfig) {
 		c.Close(errManual)
 	}
 	c.Start()
 	defer closeAndWait(c, rw)
 
-	c.inbox <- &ClusterConfig{}
+	c.inbox <- &bep.ClusterConfig{}
 
 	select {
 	case <-c.dispatcherLoopStopped:
@@ -939,52 +598,113 @@ func TestDispatcherToCloseDeadlock(t *testing.T) {
 	}
 }
 
-func TestBlocksEqual(t *testing.T) {
-	blocksOne := []BlockInfo{{Hash: []byte{1, 2, 3, 4}}}
-	blocksTwo := []BlockInfo{{Hash: []byte{5, 6, 7, 8}}}
-	hashOne := []byte{42, 42, 42, 42}
-	hashTwo := []byte{29, 29, 29, 29}
+func TestRequestMaxSize(t *testing.T) {
+	invalidSize := []int{-65536, -1, MaxRequestSize + 1}
+	for _, s := range invalidSize {
+		t.Run(fmt.Sprintf("invalid/%d", s), func(t *testing.T) {
+			m := newTestModel()
+			rw := testutil.NewBlockingRW()
+			c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
+			c.Start()
+			defer closeAndWait(c, rw)
 
-	cases := []struct {
-		b1 []BlockInfo
-		h1 []byte
-		b2 []BlockInfo
-		h2 []byte
-		eq bool
-	}{
-		{blocksOne, hashOne, blocksOne, hashOne, true},  // everything equal
-		{blocksOne, hashOne, blocksTwo, hashTwo, false}, // nothing equal
-		{blocksOne, hashOne, blocksOne, nil, true},      // blocks compared
-		{blocksOne, nil, blocksOne, nil, true},          // blocks compared
-		{blocksOne, nil, blocksTwo, nil, false},         // blocks compared
-		{blocksOne, hashOne, blocksTwo, hashOne, true},  // hashes equal, blocks not looked at
-		{blocksOne, hashOne, blocksOne, hashTwo, true},  // hashes different, blocks compared
-		{blocksOne, hashOne, blocksTwo, hashTwo, false}, // hashes different, blocks compared
-		{blocksOne, hashOne, nil, nil, false},           // blocks is different from no blocks
-		{blocksOne, nil, nil, nil, false},               // blocks is different from no blocks
-		{nil, hashOne, nil, nil, true},                  // nil blocks are equal, even of one side has a hash
+			c.inbox <- &bep.ClusterConfig{}
+
+			// A request at exactly MaxRequestSize should be accepted.
+			c.inbox <- &bep.Request{
+				Id:   1,
+				Name: "valid",
+				Size: MaxRequestSize,
+				Hash: []byte{42},
+			}
+
+			res := <-c.outbox
+			if msg, ok := res.msg.(*bep.Response); !ok || msg.Id != 1 {
+				t.Errorf("bad response %#v", msg)
+			}
+
+			// A request with an invalid size should cause the dispatcher to
+			// return with a protocol error.
+			c.inbox <- &bep.Request{
+				Id:   2,
+				Name: "invalid",
+				Size: int32(s),
+				Hash: []byte{42},
+			}
+
+			select {
+			case <-c.dispatcherLoopStopped:
+			case <-time.After(time.Second):
+				t.Fatal("timed out before dispatcher loop terminated")
+			}
+
+			err := m.closedError()
+			if err == nil {
+				t.Fatal("expected connection to be closed with an error")
+			}
+			if !strings.Contains(err.Error(), "protocol error") {
+				t.Errorf("expected a protocol error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRequestZeroSize(t *testing.T) {
+	// A zero-sized request should be accepted, since current versions of
+	// Syncthing send these. See https://github.com/syncthing/syncthing/issues/10709.
+	m := newTestModel()
+	rw := testutil.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	c.inbox <- &bep.ClusterConfig{}
+	c.inbox <- &bep.Request{
+		Id:   1,
+		Name: "valid",
+		Size: 0,
+		Hash: []byte{42},
 	}
 
-	for _, tc := range cases {
-		f1 := FileInfo{Blocks: tc.b1, BlocksHash: tc.h1}
-		f2 := FileInfo{Blocks: tc.b2, BlocksHash: tc.h2}
+	select {
+	case res := <-c.outbox:
+		if msg, ok := res.msg.(*bep.Response); !ok || msg.Id != 1 {
+			t.Errorf("bad response %#v", msg)
+		}
+	case <-c.dispatcherLoopStopped:
+		t.Fatal("dispatcher loop terminated, expected zero-sized request to be accepted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response")
+	}
+}
 
-		if !f1.BlocksEqual(f1) {
-			t.Error("f1 is always equal to itself", f1)
-		}
-		if !f2.BlocksEqual(f2) {
-			t.Error("f2 is always equal to itself", f2)
-		}
-		if res := f1.BlocksEqual(f2); res != tc.eq {
-			t.Log("f1", f1.BlocksHash, f1.Blocks)
-			t.Log("f2", f2.BlocksHash, f2.Blocks)
-			t.Errorf("f1.BlocksEqual(f2) == %v but should be %v", res, tc.eq)
-		}
-		if res := f2.BlocksEqual(f1); res != tc.eq {
-			t.Log("f1", f1.BlocksHash, f1.Blocks)
-			t.Log("f2", f2.BlocksHash, f2.Blocks)
-			t.Errorf("f2.BlocksEqual(f1) == %v but should be %v", res, tc.eq)
-		}
+func TestRequestInvalidFilename(t *testing.T) {
+	m := newTestModel()
+	rw := testutil.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	c.inbox <- &bep.ClusterConfig{}
+	c.inbox <- &bep.Request{
+		Id:   1,
+		Name: "../escape",
+		Size: 1024,
+		Hash: []byte{42},
+	}
+
+	select {
+	case <-c.dispatcherLoopStopped:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before dispatcher loop terminated")
+	}
+
+	err := m.closedError()
+	if err == nil {
+		t.Fatal("expected connection to be closed with an error")
+	}
+	if !strings.Contains(err.Error(), "protocol error") {
+		t.Errorf("expected a protocol error, got %v", err)
 	}
 }
 
@@ -996,7 +716,7 @@ func TestIndexIDString(t *testing.T) {
 	}
 }
 
-func closeAndWait(c interface{}, closers ...io.Closer) {
+func closeAndWait(c any, closers ...io.Closer) {
 	for _, closer := range closers {
 		closer.Close()
 	}

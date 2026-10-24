@@ -33,10 +33,10 @@ func newTrashcan(cfg config.FolderConfiguration) Versioner {
 	// On error we default to 0, "do not clean out the trash can"
 
 	s := &trashcan{
-		folderFs:        cfg.Filesystem(nil),
+		folderFs:        cfg.Filesystem(),
 		versionsFs:      versionerFsFromFolderCfg(cfg),
 		cleanoutDays:    cleanoutDays,
-		copyRangeMethod: cfg.CopyRangeMethod,
+		copyRangeMethod: cfg.CopyRangeMethod.ToFS(),
 	}
 
 	l.Debugf("instantiated %#v", s)

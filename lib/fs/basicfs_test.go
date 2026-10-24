@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,7 +34,7 @@ func TestChmodFile(t *testing.T) {
 	fs, dir := setup(t)
 	path := filepath.Join(dir, "file")
 
-	defer os.Chmod(path, 0666)
+	defer os.Chmod(path, 0o666)
 
 	fd, err := os.Create(path)
 	if err != nil {
@@ -42,19 +42,19 @@ func TestChmodFile(t *testing.T) {
 	}
 	fd.Close()
 
-	if err := os.Chmod(path, 0666); err != nil {
+	if err := os.Chmod(path, 0o666); err != nil {
 		t.Error(err)
 	}
 
-	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0666 {
+	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0o666 {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
 	}
 
-	if err := fs.Chmod("file", 0444); err != nil {
+	if err := fs.Chmod("file", 0o444); err != nil {
 		t.Error(err)
 	}
 
-	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0444 {
+	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0o444 {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
 	}
 }
@@ -74,7 +74,7 @@ func TestChownFile(t *testing.T) {
 	fs, dir := setup(t)
 	path := filepath.Join(dir, "file")
 
-	defer os.Chmod(path, 0666)
+	defer os.Chmod(path, 0o666)
 
 	fd, err := os.Create(path)
 	if err != nil {
@@ -110,9 +110,9 @@ func TestChmodDir(t *testing.T) {
 	fs, dir := setup(t)
 	path := filepath.Join(dir, "dir")
 
-	mode := os.FileMode(0755)
+	mode := os.FileMode(0o755)
 	if build.IsWindows {
-		mode = os.FileMode(0777)
+		mode = os.FileMode(0o777)
 	}
 
 	defer os.Chmod(path, mode)
@@ -129,11 +129,11 @@ func TestChmodDir(t *testing.T) {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
 	}
 
-	if err := fs.Chmod("dir", 0555); err != nil {
+	if err := fs.Chmod("dir", 0o555); err != nil {
 		t.Error(err)
 	}
 
-	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0555 {
+	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0o555 {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
 	}
 }
@@ -218,10 +218,10 @@ func TestDirNames(t *testing.T) {
 		"a",
 		"bC",
 	}
-	sort.Strings(testCases)
+	slices.Sort(testCases)
 
 	for _, sub := range testCases {
-		if err := os.Mkdir(filepath.Join(dir, sub), 0777); err != nil {
+		if err := os.Mkdir(filepath.Join(dir, sub), 0o777); err != nil {
 			t.Error(err)
 		}
 	}
@@ -229,7 +229,7 @@ func TestDirNames(t *testing.T) {
 	if dirs, err := fs.DirNames("."); err != nil || len(dirs) != len(testCases) {
 		t.Errorf("%s %s %s", err, dirs, testCases)
 	} else {
-		sort.Strings(dirs)
+		slices.Sort(dirs)
 		for i := range dirs {
 			if dirs[i] != testCases[i] {
 				t.Errorf("%s != %s", dirs[i], testCases[i])
@@ -256,7 +256,7 @@ func TestNames(t *testing.T) {
 		t.Errorf("incorrect %s != %s (%v)", stat.Name(), expected, err)
 	}
 
-	if err := fs.Mkdir("dir", 0777); err != nil {
+	if err := fs.Mkdir("dir", 0o777); err != nil {
 		t.Error(err)
 	}
 
@@ -286,7 +286,7 @@ func TestGlob(t *testing.T) {
 		filepath.Join("a", "best", "b"),
 		filepath.Join("a", "best", "c"),
 	} {
-		if err := fs.MkdirAll(dirToCreate, 0777); err != nil {
+		if err := fs.MkdirAll(dirToCreate, 0o777); err != nil {
 			t.Error(err)
 		}
 	}
@@ -321,8 +321,8 @@ func TestGlob(t *testing.T) {
 
 	for _, testCase := range testCases {
 		results, err := fs.Glob(testCase.pattern)
-		sort.Strings(results)
-		sort.Strings(testCase.matches)
+		slices.Sort(results)
+		slices.Sort(testCase.matches)
 		if err != nil {
 			t.Error(err)
 		}
@@ -572,7 +572,7 @@ func TestRel(t *testing.T) {
 
 func TestXattr(t *testing.T) {
 	tfs, _ := setup(t)
-	if err := tfs.Mkdir("/test", 0755); err != nil {
+	if err := tfs.Mkdir("/test", 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -580,7 +580,7 @@ func TestXattr(t *testing.T) {
 
 	// Create a set of random attributes that we will set and read back
 	var attrs []protocol.Xattr
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		key := fmt.Sprintf("user.test-%d", i)
 		value := make([]byte, xattrSize())
 		rand.Read(value)
@@ -628,8 +628,7 @@ func TestXattr(t *testing.T) {
 			Value: value,
 		})
 	}
-	sort.Slice(attrs, func(i, j int) bool { return attrs[i].Name < attrs[j].Name })
-
+	slices.SortFunc(attrs, func(a, b protocol.Xattr) int { return strings.Compare(a.Name, b.Name) })
 	// Set the xattrs, read them back and compare
 	if err := tfs.SetXattr("/test", attrs, testXattrFilter{}); err != nil {
 		t.Fatal(err)
