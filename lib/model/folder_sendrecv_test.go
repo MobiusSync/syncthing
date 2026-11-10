@@ -774,6 +774,31 @@ func TestCopyOwner(t *testing.T) {
 	}
 }
 
+func TestCopyOwnerMissingParents(t *testing.T) {
+	if build.IsWindows {
+		t.Skip("copying owner not supported on Windows")
+	}
+
+	m, f := setupSendReceiveFolder(t)
+	f.folder.FolderConfiguration = newFolderConfiguration(m.cfg, f.ID, f.Label, config.FilesystemTypeFake, "/TestCopyOwnerMissingParents")
+	f.CopyOwnershipFromParent = true
+	must(t, f.mtimefs.Lchown(".", "1111", "2222"))
+	must(t, f.mtimefs.Mkdir("existing", 0o755))
+	must(t, f.mtimefs.Lchown("existing", "1234", "5678"))
+
+	scanChan := make(chan string, 1)
+	if !f.checkParent(filepath.FromSlash("existing/one/two/file"), scanChan) {
+		t.Fatal("creating missing parents failed")
+	}
+	for _, name := range []string{"existing", "existing/one", "existing/one/two"} {
+		info, err := f.mtimefs.Lstat(name)
+		must(t, err)
+		if info.Owner() != 1234 || info.Group() != 5678 {
+			t.Errorf("%s: expected owner/group 1234/5678, got %d/%d", name, info.Owner(), info.Group())
+		}
+	}
+}
+
 // TestSRConflictReplaceFileByDir checks that a conflict is created when an existing file
 // is replaced with a directory and versions are conflicting
 func TestSRConflictReplaceFileByDir(t *testing.T) {
@@ -1306,6 +1331,74 @@ func TestPullDeleteIgnoreChildDir(t *testing.T) {
 	err := f.deleteDirOnDisk(parent, scanChan)
 	if err == nil {
 		t.Error("no error")
+	}
+}
+
+func TestShortcutFileLocalChange(t *testing.T) {
+	// Metadata shortcut should not stomp on concurrent local changes.
+
+	for _, change := range []string{"unchanged", "contents", "mtime", "deleted", "directory"} {
+		t.Run(change, func(t *testing.T) {
+			_, f := setupSendReceiveFolder(t)
+			ffs := f.Filesystem()
+			cur := createEmptyFileInfo(t, "file", ffs)
+			remote := cur
+			remote.ModifiedS += 3600
+
+			switch change {
+			case "contents":
+				writeFile(t, ffs, cur.Name, []byte("local change"))
+			case "mtime":
+				mtime := cur.ModTime().Add(-time.Hour)
+				must(t, ffs.Chtimes(cur.Name, mtime, mtime))
+			case "deleted":
+				must(t, ffs.Remove(cur.Name))
+			case "directory":
+				must(t, ffs.Remove(cur.Name))
+				must(t, ffs.Mkdir(cur.Name, 0o755))
+			}
+			before, beforeErr := ffs.Lstat(cur.Name)
+			dbUpdateChan := make(chan dbUpdateJob, 1)
+			scanChan := make(chan string, 1)
+			f.shortcutFile(remote, cur, dbUpdateChan, scanChan)
+
+			if change == "unchanged" {
+				select {
+				case job := <-dbUpdateChan:
+					if job.file.ModifiedS != remote.ModifiedS {
+						t.Fatal("incorrect metadata update")
+					}
+				default:
+					t.Fatal("missing database update")
+				}
+				if len(scanChan) != 0 {
+					t.Fatal("unchanged file scheduled for scanning")
+				}
+				return
+			}
+
+			if len(dbUpdateChan) != 0 {
+				t.Error("local change overwritten in database")
+			}
+			select {
+			case name := <-scanChan:
+				if name != cur.Name {
+					t.Errorf("unexpected scan: %q", name)
+				}
+			default:
+				t.Error("local change not scheduled for scanning")
+			}
+
+			after, afterErr := ffs.Lstat(cur.Name)
+			if beforeErr == nil {
+				must(t, afterErr)
+				if !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() || before.Size() != after.Size() {
+					t.Error("local metadata changed")
+				}
+			} else if !fs.IsNotExist(afterErr) {
+				t.Error("deleted file reappeared")
+			}
+		})
 	}
 }
 

@@ -393,7 +393,7 @@ loop:
 				// We are supposed to copy the entire file, and then fetch nothing. We
 				// are only updating metadata, so we don't actually *need* to make the
 				// copy.
-				f.shortcutFile(file, dbUpdateChan)
+				f.shortcutFile(file, curFile, dbUpdateChan, scanChan)
 			} else {
 				// Queue files for processing after directories and symlinks.
 				f.queue.Push(file.Name, file.Size, file.ModTime())
@@ -670,10 +670,10 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
 			f.newPullError(file.Name, fmt.Errorf("handling dir (setting permissions): %w", err))
 			return
 		}
-		if err := f.setPlatformData(&file, file.Name); err != nil {
-			f.newPullError(file.Name, fmt.Errorf("handling dir (setting metadata): %w", err))
-			return
-		}
+	}
+	if err := f.setPlatformData(&file, file.Name); err != nil {
+		f.newPullError(file.Name, fmt.Errorf("handling dir (setting metadata): %w", err))
+		return
 	}
 	dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleDir}
 }
@@ -708,7 +708,7 @@ func (f *sendReceiveFolder) checkParent(file string, scanChan chan<- string) boo
 		return true
 	}
 	f.sl.Debug("Creating parent directory", slogutil.FilePath(file))
-	if err := f.mtimefs.MkdirAll(parent, fs.ModePerm); err != nil {
+	if err := f.mkdirAllWithOwnership(parent); err != nil {
 		f.newPullError(file, fmt.Errorf("creating parent dir: %w", err))
 		return false
 	}
@@ -716,6 +716,34 @@ func (f *sendReceiveFolder) checkParent(file string, scanChan chan<- string) boo
 		scanChan <- parent
 	}
 	return true
+}
+
+// mkdirAllWithOwnership creates missing parents from the top down so each
+// directory inherits the ownership of its parent before creating children.
+func (f *sendReceiveFolder) mkdirAllWithOwnership(path string) error {
+	if !f.CopyOwnershipFromParent || build.IsWindows {
+		return f.mtimefs.MkdirAll(path, fs.ModePerm)
+	}
+
+	if _, err := f.mtimefs.Lstat(path); !fs.IsNotExist(err) {
+		// Let MkdirAll check that an existing path is a directory.
+		return f.mtimefs.MkdirAll(path, fs.ModePerm)
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return fs.ErrNotExist
+	}
+	if err := f.mkdirAllWithOwnership(parent); err != nil {
+		return err
+	}
+	if err := f.mtimefs.Mkdir(path, fs.ModePerm); err != nil {
+		if fs.IsExist(err) {
+			// Another process may have created it. Preserve its ownership.
+			return f.mtimefs.MkdirAll(path, fs.ModePerm)
+		}
+		return err
+	}
+	return f.copyOwnershipFromParent(path)
 }
 
 // handleSymlink creates or updates the given symlink
@@ -1258,7 +1286,7 @@ func populateOffsets(blocks []protocol.BlockInfo) {
 
 // shortcutFile sets file metadata, when that's the only thing that has
 // changed.
-func (f *sendReceiveFolder) shortcutFile(file protocol.FileInfo, dbUpdateChan chan<- dbUpdateJob) {
+func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) {
 	f.sl.Debug("Taking metadata shortcut", slogutil.FilePath(file.Name))
 
 	f.evLogger.Log(events.ItemStarted, map[string]string{
@@ -1285,6 +1313,18 @@ func (f *sendReceiveFolder) shortcutFile(file protocol.FileInfo, dbUpdateChan ch
 	}()
 
 	f.queue.Done(file.Name)
+
+	info, err := f.mtimefs.Lstat(file.Name)
+	if fs.IsNotExist(err) {
+		scanChan <- file.Name
+		err = errModified
+	} else if err == nil {
+		err = f.scanIfItemChanged(file.Name, info, curFile, true, false, scanChan)
+	}
+	if err != nil {
+		f.newPullError(file.Name, fmt.Errorf("shortcut file (checking existing file): %w", err))
+		return
+	}
 
 	if !f.IgnorePerms && !file.NoPermissions {
 		if err = f.mtimefs.Chmod(file.Name, fs.FileMode(file.Permissions&0o777)); err != nil {
